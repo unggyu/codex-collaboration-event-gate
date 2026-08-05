@@ -5,6 +5,8 @@
   "author": {
     "name": "codex-collaboration-event-gate contributors"
   },
+  "homepage": "https://github.com/unggyu/codex-collaboration-event-gate",
+  "repository": "https://github.com/unggyu/codex-collaboration-event-gate",
   "license": "MIT",
   "keywords": [
     "codex",
@@ -24,6 +26,7 @@
       "Codex lifecycle hooks",
       "Multi-agent coordination"
     ],
+    "websiteURL": "https://github.com/unggyu/codex-collaboration-event-gate",
     "defaultPrompt": [
       "Coordinate bounded Codex workers with the event gate."
     ]

@@ -27,5 +27,5 @@ runtime data.
 ## Scope
 
 This project is intentionally local-first. Do not create a marketplace entry,
-remote, release, hook trust record, or live Codex session as part of a normal
-code change. Those actions require an explicit maintainer decision.
+release, hook trust record, or live Codex session as part of a normal code
+change. Those actions require an explicit maintainer decision.

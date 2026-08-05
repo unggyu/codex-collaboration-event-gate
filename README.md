@@ -1,5 +1,7 @@
 # Codex Collaboration Event Gate
 
+[![CI](https://github.com/unggyu/codex-collaboration-event-gate/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/unggyu/codex-collaboration-event-gate/actions/workflows/ci.yml)
+
 `codex-collaboration-event-gate` is a local Codex plugin for coordinating
 native subagents without turning the parent into a polling loop. It keeps the
 parent turn interactive while workers run, authorizes one native completion
@@ -7,6 +9,8 @@ subscription at a time, and prevents a final response while tracked work
 remains.
 
 This is executable hook code. Review it before trusting it.
+
+Source: <https://github.com/unggyu/codex-collaboration-event-gate>
 
 ## What it guarantees
 
@@ -75,7 +79,7 @@ personal marketplace, place a clone at:
 
 ```bash
 mkdir -p "$HOME/plugins"
-git clone <published-repository-url> \
+git clone https://github.com/unggyu/codex-collaboration-event-gate.git \
   "$HOME/plugins/codex-collaboration-event-gate"
 ```
 
@@ -176,5 +180,7 @@ owned copy. Re-review project hooks and start a new session after every change.
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md). This source
-tree intentionally contains no remote URL, personal marketplace data, trust
-database, installed cache, runtime state, session record, or credentials.
+tree intentionally contains no personal marketplace data, trust database,
+installed cache, runtime state, session record, or credentials. Hosting this
+source repository does not publish the plugin through an official universal
+plugin marketplace.

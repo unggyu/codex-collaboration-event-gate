@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Collaboration Event Gate"
+  short_description: "Coordinate subagents with an event-driven Stop gate"
+  default_prompt: "Use $codex-collaboration-event-gate to coordinate bounded subagents without wait polling."

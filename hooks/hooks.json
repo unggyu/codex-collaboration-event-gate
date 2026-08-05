@@ -1,0 +1,118 @@
+{
+  "description": "Event-driven parent-turn completion gate for native Codex subagents.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/hooks/codex-collaboration-lifecycle.py\"",
+            "timeout": 3,
+            "statusMessage": "Initializing collaboration event gate",
+            "additionalContextLimit": 600
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Agent|spawn_agent$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/hooks/codex-collaboration-lifecycle.py\"",
+            "timeout": 3,
+            "statusMessage": "Recording Codex worker dispatch"
+          }
+        ]
+      },
+      {
+        "matcher": "wait_agent$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/hooks/codex-collaboration-lifecycle.py\"",
+            "timeout": 3,
+            "statusMessage": "Checking Codex wait recovery"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Agent|spawn_agent$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/hooks/codex-collaboration-lifecycle.py\"",
+            "timeout": 3,
+            "statusMessage": "Reconciling Codex worker dispatch"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/hooks/codex-collaboration-lifecycle.py\"",
+            "timeout": 3,
+            "statusMessage": "Re-arming collaboration after steering",
+            "additionalContextLimit": 400
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/hooks/codex-collaboration-lifecycle.py\"",
+            "timeout": 3,
+            "statusMessage": "Tracking Codex subagent"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/hooks/codex-collaboration-lifecycle.py\"",
+            "timeout": 3,
+            "statusMessage": "Reconciling Codex subagent"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/hooks/codex-collaboration-lifecycle.py\"",
+            "timeout": 3,
+            "statusMessage": "Checking active Codex subagents"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "other",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/hooks/codex-collaboration-lifecycle.py\"",
+            "timeout": 3,
+            "statusMessage": "Cleaning collaboration event state"
+          }
+        ]
+      }
+    ]
+  }
+}

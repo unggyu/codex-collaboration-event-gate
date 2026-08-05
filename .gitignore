@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+*.egg-info/
+
+# Codex/plugin runtime data and local install artifacts
+.codex-runtime/
+.plugin-data/
+audit/
+sessions/
+*.log

@@ -117,6 +117,13 @@ def permission(value):
     return value["hookSpecificOutput"]["permissionDecision"]
 
 
+def session_state_file(state_name):
+    """Return the one state object, never the similarly named audit list."""
+    candidates = list((tmp_root / state_name / "sessions").glob("*.json"))
+    assert len(candidates) == 1, candidates
+    return candidates[0]
+
+
 session_result, _ = run_hook(payload("SessionStart", "session"), "session")
 context = session_result["hookSpecificOutput"]["additionalContext"]
 assert "interruptible by steered user input" in context
@@ -174,11 +181,8 @@ with ThreadPoolExecutor(max_workers=16) as pool:
             agents,
         )
     )
-state_file = next(
-    path
-    for path in (tmp_root / state_name).rglob("*.json")
-    if not path.name.endswith(".recovery.json")
-)
+assert list((tmp_root / state_name / "audit").glob("*.json"))
+state_file = session_state_file(state_name)
 assert len(json.loads(state_file.read_text())["workers"]) == len(agents)
 with ThreadPoolExecutor(max_workers=15) as pool:
     list(
@@ -199,11 +203,7 @@ print("PASS: concurrent lifecycle updates preserve every active worker.")
 state_name = "corrupt"
 session = "corrupt"
 run_hook(payload("SubagentStart", session, "agent-a"), state_name)
-state_file = next(
-    path
-    for path in (tmp_root / state_name).rglob("*.json")
-    if not path.name.endswith(".recovery.json")
-)
+state_file = session_state_file(state_name)
 state_file.write_text("{", encoding="utf-8")
 corrupt, elapsed = run_hook(payload("Stop", session), state_name)
 assert elapsed < 0.5

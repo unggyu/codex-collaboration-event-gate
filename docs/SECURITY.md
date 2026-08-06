@@ -31,10 +31,12 @@ threat model.
 ## Data minimization
 
 State stores a hashed session identity, opaque worker IDs, agent types, turn
-IDs, timestamps, authorization epochs, and pending dispatch capabilities keyed
-by a hashed native tool-call ID. Audit records hold only hashed session/turn/
-tool/agent identities, event kind, epoch, timestamp, and outcome; they contain
-no prompt, tool input, tool output, cwd, transcript, or secret. Retention is
+IDs, timestamps, authorization epochs, pending dispatch capabilities, exact
+target hashes for interruption, and a hashed in-flight wait call. Native tool
+call IDs and interruption targets are never stored in state verbatim. Audit
+records hold only hashed session/turn/tool/agent identities, event kind, epoch,
+timestamp, and outcome; they contain no prompt, tool input, tool output, cwd,
+transcript, or secret. Retention is
 bounded to 128 records per session, 256 audit files, and 14 days. The runtime
 does not read transcripts, worker output, prompts, source files, Git metadata,
 or network services.

@@ -18,8 +18,12 @@ Source: <https://github.com/unggyu/codex-collaboration-event-gate>
   dispatch-to-lifecycle delivery gap.
 - Rewrites the one authorized root `wait_agent` timeout to `3600000` ms. The
   native subscription is interruptible by a new user message.
-- Re-arms exactly one subscription after a worker completion, a new dispatch,
-  or user steering while work remains.
+- Re-arms exactly one subscription after a worker completion, a non-timeout
+  wait return (including an intermediate worker message), a new dispatch, or
+  user steering while work remains.
+- Reconciles a successful `interrupt_agent` only when its Pre/Post tool-call
+  identity and exact worker or pending-dispatch target match. Other workers are
+  never removed by FIFO fallback during interruption.
 - Makes `Stop` immediate and nonblocking. It denies a final while a worker or
   pending dispatch is tracked, without holding the composer hostage.
 - Rejects repeated waits, child waits, recursive worker dispatches, malformed
@@ -29,7 +33,7 @@ Source: <https://github.com/unggyu/codex-collaboration-event-gate>
 ## What it does not do
 
 - It cannot invoke `wait_agent` itself. The coordinator must call it after a
-  dispatch and after each newly authorized lifecycle event.
+  dispatch and after each newly authorized lifecycle or non-timeout wait event.
 - It does not poll, sleep, watch files, use FIFOs, inspect transcripts or
   project source, contact a network service, or create a post-final wake-up.
 - It does not decide whether a worker result satisfies user acceptance
@@ -116,6 +120,12 @@ Run the self-contained checks first:
 bash scripts/run-tests.sh
 ```
 
+Before reinstalling, exit every Codex session that loaded the previous plugin
+snapshot. Run the reinstall command from a plain shell, not from a Codex
+session using this plugin. Running sessions retain the resolved cache path;
+reinstalling while one is alive can remove that path and make its later hooks
+fail before Python starts.
+
 When the plugin payload changes, use the official `plugin-creator` update flow
 from an environment where that developer tool is available:
 
@@ -126,10 +136,10 @@ codex plugin add codex-collaboration-event-gate@<marketplace-name>
 ```
 
 The helper changes only the Codex build metadata suffix while preserving the
-semantic version. It is intentionally not part of CI. Reopen `/hooks`, review
-and trust the changed snapshot, then start a new session. Never hand-edit the
-installed cache, marketplace database, or Codex configuration to force an
-update.
+semantic version. It is intentionally not part of CI. After the plain-shell
+reinstall finishes, start a new session, reopen `/hooks`, and review and trust
+the changed snapshot. Never hand-edit the installed cache, marketplace
+database, or Codex configuration to force an update.
 
 ## Test and validate
 

@@ -44,6 +44,7 @@ def wait_payload(
     tool_input=None,
     tool_name="collaborationwait_agent",
     child=False,
+    call_id=None,
 ):
     value = {
         "cwd": "/safe/non-git/project",
@@ -51,6 +52,7 @@ def wait_payload(
         "session_id": session,
         "tool_input": {} if tool_input is None else tool_input,
         "tool_name": tool_name,
+        "tool_use_id": call_id or f"wait-{session}",
         "turn_id": f"turn-{session}",
     }
     if child:
@@ -58,12 +60,47 @@ def wait_payload(
     return value
 
 
-def spawn_payload(session, call_id, *, child=False, tool_name="Agent"):
+def tool_post(session, call_id, tool_name, tool_input, response):
+    return {
+        "cwd": "/safe/non-git/project",
+        "hook_event_name": "PostToolUse",
+        "session_id": session,
+        "tool_input": tool_input,
+        "tool_name": tool_name,
+        "tool_response": response,
+        "tool_use_id": call_id,
+        "turn_id": f"turn-{session}",
+    }
+
+
+def interrupt_payload(session, call_id, target, event="PreToolUse", response=None):
+    value = {
+        "cwd": "/safe/non-git/project",
+        "hook_event_name": event,
+        "session_id": session,
+        "tool_input": {"target": target},
+        "tool_name": "collaborationinterrupt_agent",
+        "tool_use_id": call_id,
+        "turn_id": f"turn-{session}",
+    }
+    if event == "PostToolUse":
+        value["tool_response"] = response
+    return value
+
+
+def spawn_payload(
+    session,
+    call_id,
+    *,
+    child=False,
+    tool_name="Agent",
+    task_name="opaque-test-worker",
+):
     value = {
         "cwd": "/safe/non-git/project",
         "hook_event_name": "PreToolUse",
         "session_id": session,
-        "tool_input": {"task_name": "opaque-test-worker"},
+        "tool_input": {"task_name": task_name},
         "tool_name": tool_name,
         "tool_use_id": call_id,
         "turn_id": f"turn-{session}",
@@ -73,12 +110,12 @@ def spawn_payload(session, call_id, *, child=False, tool_name="Agent"):
     return value
 
 
-def spawn_post(session, call_id, response):
+def spawn_post(session, call_id, response, task_name="opaque-test-worker"):
     return {
         "cwd": "/safe/non-git/project",
         "hook_event_name": "PostToolUse",
         "session_id": session,
-        "tool_input": {"task_name": "opaque-test-worker"},
+        "tool_input": {"task_name": task_name},
         "tool_name": "Agent",
         "tool_response": response,
         "tool_use_id": call_id,
@@ -174,6 +211,168 @@ for index, tool_name in enumerate(
         "already consumed",
     )
 print("PASS: every native wait spelling is rewritten once and repeated waits are denied.")
+
+# A native wait may return for an intermediate MESSAGE without completing the
+# worker. Its matching PostToolUse event re-arms exactly one subscription. A
+# timeout does not, so the hook never turns timeouts into a polling loop.
+state_name = "wait-intermediate-message"
+session = state_name
+run_hook(lifecycle("SubagentStart", session, "agent-a"), state_name)
+run_hook(lifecycle("SubagentStart", session, "agent-b"), state_name)
+first_wait = "wait-message-first"
+assert_allowed(
+    run_hook(wait_payload(session, call_id=first_wait), state_name)
+)
+returned = run_hook(
+    tool_post(
+        session,
+        first_wait,
+        "collaborationwait_agent",
+        {"timeout_ms": 3_600_000},
+        '{"message":"Wait completed.","timed_out":false}',
+    ),
+    state_name,
+)
+assert "MESSAGE/FINAL/error" in returned["hookSpecificOutput"]["additionalContext"]
+assert_allowed(
+    run_hook(wait_payload(session, call_id="wait-message-second"), state_name)
+)
+assert_denied(
+    run_hook(wait_payload(session, call_id="wait-message-third"), state_name),
+    "already consumed",
+)
+snapshot = json.loads(state_files(state_name)[0].read_text(encoding="utf-8"))
+assert set(snapshot["workers"]) == {"agent-a", "agent-b"}
+
+state_name = "wait-timeout"
+session = state_name
+run_hook(lifecycle("SubagentStart", session, "agent-a"), state_name)
+timeout_wait = "wait-timeout-first"
+assert_allowed(run_hook(wait_payload(session, call_id=timeout_wait), state_name))
+assert run_hook(
+    tool_post(
+        session,
+        timeout_wait,
+        "collaborationwait_agent",
+        {"timeout_ms": 3_600_000},
+        {"message": "Wait timed out.", "timed_out": True},
+    ),
+    state_name,
+) == {}
+assert_denied(
+    run_hook(wait_payload(session, call_id="wait-timeout-second"), state_name),
+    "already consumed",
+)
+print("PASS: non-timeout wait returns re-arm once while timeouts never create polling authority.")
+
+# A successful interrupt removes only the capability's exact target. A later
+# duplicate SubagentStop for that target cannot consume or remove another
+# worker, and an unconfirmed interrupt response removes nothing.
+state_name = "interrupt-one-of-two"
+session = state_name
+for suffix in ("a", "b"):
+    task_name = f"worker-{suffix}"
+    spawn_call = f"spawn-{suffix}"
+    run_hook(
+        spawn_payload(session, spawn_call, task_name=task_name), state_name
+    )
+    run_hook(
+        spawn_post(
+            session,
+            spawn_call,
+            {"task_name": f"/root/{task_name}"},
+            task_name=task_name,
+        ),
+        state_name,
+    )
+    run_hook(
+        lifecycle("SubagentStart", session, f"opaque-agent-{suffix}"),
+        state_name,
+    )
+interrupt_call = "interrupt-agent-a"
+assert run_hook(
+    interrupt_payload(session, interrupt_call, "/root/worker-a"), state_name
+) == {}
+assert_denied(
+    run_hook(
+        interrupt_payload(session, interrupt_call, "/root/worker-b"),
+        state_name,
+    ),
+    "already bound",
+)
+interrupted = run_hook(
+    interrupt_payload(
+        session,
+        interrupt_call,
+        "/root/worker-a",
+        event="PostToolUse",
+        response='{"previous_status":"running"}',
+    ),
+    state_name,
+)
+assert "exact interrupted target" in interrupted["hookSpecificOutput"]["additionalContext"]
+snapshot = json.loads(state_files(state_name)[0].read_text(encoding="utf-8"))
+assert set(snapshot["workers"]) == {"opaque-agent-b"}
+assert_allowed(
+    run_hook(wait_payload(session, call_id="wait-after-interrupt"), state_name)
+)
+run_hook(lifecycle("SubagentStop", session, "opaque-agent-a"), state_name)
+assert_denied(
+    run_hook(wait_payload(session, call_id="wait-after-duplicate-stop"), state_name),
+    "already consumed",
+)
+assert run_hook(lifecycle("Stop", session), state_name).get("decision") == "block"
+
+failed_call = "interrupt-agent-b-failed"
+assert run_hook(
+    interrupt_payload(session, failed_call, "/root/worker-b"), state_name
+) == {}
+assert run_hook(
+    interrupt_payload(
+        session,
+        failed_call,
+        "/root/worker-b",
+        event="PostToolUse",
+        response={"error": "native interruption failed"},
+    ),
+    state_name,
+) == {}
+snapshot = json.loads(state_files(state_name)[0].read_text(encoding="utf-8"))
+assert set(snapshot["workers"]) == {"opaque-agent-b"}
+
+ambiguous_call = "interrupt-agent-b-ambiguous"
+assert run_hook(
+    interrupt_payload(session, ambiguous_call, "/root/worker-b"), state_name
+) == {}
+assert run_hook(
+    interrupt_payload(
+        session,
+        ambiguous_call,
+        "/root/worker-b",
+        event="PostToolUse",
+        response={"status": "cancelled"},
+    ),
+    state_name,
+) == {}
+snapshot = json.loads(state_files(state_name)[0].read_text(encoding="utf-8"))
+assert set(snapshot["workers"]) == {"opaque-agent-b"}
+
+terminal_call = "interrupt-agent-b-terminal"
+assert run_hook(
+    interrupt_payload(session, terminal_call, "/root/worker-b"), state_name
+) == {}
+run_hook(
+    interrupt_payload(
+        session,
+        terminal_call,
+        "/root/worker-b",
+        event="PostToolUse",
+        response={"status": "cancelled", "success": True},
+    ),
+    state_name,
+)
+assert run_hook(lifecycle("Stop", session, active=True), state_name) == {}
+print("PASS: interrupt reconciliation removes exactly one confirmed target and preserves every other worker.")
 
 # PreToolUse(spawn_agent) is the durable authority. It must allow the first
 # wait and deny Stop while a later or dropped SubagentStart has not arrived.

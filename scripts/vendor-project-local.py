@@ -89,9 +89,35 @@ def hook_config(runner: Path) -> dict[str, Any]:
             ],
             "PreToolUse": [
                 {
+                    "matcher": "Agent|spawn_agent$",
+                    "hooks": [handler("Recording Codex worker dispatch")],
+                },
+                {
                     "matcher": "wait_agent$",
                     "hooks": [handler("Checking Codex wait authorization")],
-                }
+                },
+                {
+                    "matcher": "interrupt_agent$",
+                    "hooks": [
+                        handler("Recording exact Codex worker interruption")
+                    ],
+                },
+            ],
+            "PostToolUse": [
+                {
+                    "matcher": "Agent|spawn_agent$",
+                    "hooks": [handler("Reconciling Codex worker dispatch")],
+                },
+                {
+                    "matcher": "wait_agent$",
+                    "hooks": [handler("Re-arming after a Codex wait event")],
+                },
+                {
+                    "matcher": "interrupt_agent$",
+                    "hooks": [
+                        handler("Reconciling exact Codex worker interruption")
+                    ],
+                },
             ],
             "UserPromptSubmit": [
                 {
@@ -111,6 +137,12 @@ def hook_config(runner: Path) -> dict[str, Any]:
             ],
             "Stop": [
                 {"hooks": [handler("Checking active Codex subagents")]}
+            ],
+            "SessionEnd": [
+                {
+                    "matcher": "other",
+                    "hooks": [handler("Cleaning collaboration event state")],
+                }
             ],
         },
     }

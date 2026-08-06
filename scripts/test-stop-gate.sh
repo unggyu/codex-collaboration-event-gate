@@ -59,9 +59,14 @@ for groups in config.values():
 assert config["Stop"][0]["hooks"][0]["timeout"] == 3
 assert {group.get("matcher") for group in config["PreToolUse"]} == {
     "Agent|spawn_agent$",
+    "interrupt_agent$",
     "wait_agent$",
 }
-assert config["PostToolUse"][0]["matcher"] == "Agent|spawn_agent$"
+assert {group.get("matcher") for group in config["PostToolUse"]} == {
+    "Agent|spawn_agent$",
+    "interrupt_agent$",
+    "wait_agent$",
+}
 
 
 def environment(state_name):
@@ -92,6 +97,7 @@ def wait_payload(session, tool_input=None):
         "session_id": session,
         "tool_input": {} if tool_input is None else tool_input,
         "tool_name": "collaborationwait_agent",
+        "tool_use_id": f"wait-{session}",
         "turn_id": f"turn-{session}",
     }
 

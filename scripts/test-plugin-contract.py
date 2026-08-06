@@ -20,6 +20,8 @@ HOOK = ROOT / "hooks" / "codex-collaboration-lifecycle.py"
 CONFIG = ROOT / "hooks" / "hooks.json"
 MANIFEST = ROOT / ".codex-plugin" / "plugin.json"
 VENDOR = ROOT / "scripts" / "vendor-project-local.py"
+README = ROOT / "README.md"
+SKILL = ROOT / "skills" / ROOT.name / "SKILL.md"
 
 
 def run(
@@ -79,6 +81,15 @@ for node in ast.walk(tree):
     assert name not in {"sleep", "time.sleep", "wait_agent", "list_agents"}
 print("PASS: manifest and default-discovery hook contract are portable.")
 
+readme = README.read_text(encoding="utf-8")
+skill = SKILL.read_text(encoding="utf-8")
+for guidance in (readme, skill):
+    normalized = " ".join(guidance.split())
+    assert "plain shell" in normalized
+    assert "exit every Codex session" in normalized
+    assert "resolved cache path" in normalized
+print("PASS: update guidance preserves the active-session cache boundary.")
+
 with tempfile.TemporaryDirectory(prefix="codex-event-gate-vendor.") as name:
     temporary = Path(name)
     fake_bin = temporary / "bin"
@@ -123,6 +134,12 @@ with tempfile.TemporaryDirectory(prefix="codex-event-gate-vendor.") as name:
     assert stat.S_IMODE((vendored / HOOK.name).stat().st_mode) == 0o755
 
     vendored_config = json.loads(hooks_json.read_text(encoding="utf-8"))
+    vendored_hooks = vendored_config["hooks"]
+    assert set(vendored_hooks) == set(config["hooks"])
+    for event in ("PreToolUse", "PostToolUse"):
+        assert {group.get("matcher") for group in vendored_hooks[event]} == {
+            group.get("matcher") for group in config["hooks"][event]
+        }
     command = vendored_config["hooks"]["SessionStart"][0]["hooks"][0]["command"]
     nested = project / "a" / "deep" / "cwd"
     nested.mkdir(parents=True)

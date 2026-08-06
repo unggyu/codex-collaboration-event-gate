@@ -13,6 +13,8 @@ the `Stop` hook is an enforcement check, not the waiter.
 | `SessionStart` | Validate plugin data and inject the coordination contract |
 | `PreToolUse(spawn_agent)` | Record a pending dispatch before native worker creation can race the lifecycle hook |
 | `PostToolUse(spawn_agent)` | Clear explicitly failed dispatches and retain successful pending work until reconciliation |
+| `Pre/PostToolUse(interrupt_agent)` | Bind one interruption to an exact tracked target and remove it only after a confirmed successful response |
+| `PostToolUse(wait_agent)` | Re-arm one subscription after a correlated non-timeout return while work remains |
 | `SubagentStart` | Promote the oldest session-local pending dispatch to a worker; record unpaired starts safely |
 | `SubagentStop` | Remove a worker or reconcile a dropped `SubagentStart` pending dispatch |
 | `UserPromptSubmit` | Re-arm one wait when steering arrives with active workers |
@@ -26,7 +28,8 @@ the `Stop` hook is an enforcement check, not the waiter.
 
 Each session uses a SHA-256 filename beneath `${PLUGIN_DATA}/sessions`. Its
 state contains active workers, pending dispatch capabilities keyed by hashed
-tool-call id, `event_epoch`, `wait_issued_epoch`, and
+tool-call id, exact-target interrupt capabilities, `event_epoch`,
+`wait_issued_epoch`, the hashed in-flight wait call, and
 `stop_continuation_epoch`. A pending capability is active for `wait_agent` and
 `Stop` purposes until a native start promotes it, an explicit spawn failure
 clears it, or a later stop reconciles a missing start. This closes the native
@@ -44,15 +47,20 @@ wall-clock timestamp ordering, makes concurrent dispatch ordering deterministic.
 | Explicit spawn failure | Remove pending; increment epoch | One wait only if other work remains |
 | Unpaired worker start | Add worker; increment epoch | One root wait |
 | First root wait | Set `wait_issued_epoch` | No repeat in this epoch |
+| Non-timeout wait return | Match the in-flight tool-call id; increment epoch if work remains | One root wait after reconciling returned messages/results |
+| Wait timeout/failure | Clear the in-flight tool-call id without changing epoch | No retry or polling wait |
 | Worker completion | Remove worker or unpaired pending; increment epoch | One wait if work remains |
+| Interrupt request | Bind tool-call id to one exact worker/pending target | Await native response; no lifecycle epoch yet |
+| Confirmed interrupt result | Remove only the bound target; increment epoch | One wait if other work remains |
 | User steering | Increment epoch | One wait after reconciliation |
 | New dispatch | Add worker; increment epoch | One wait |
 | First active-worker Stop | Increment epoch; mark continuation | One wait from immediate continuation |
 | Repeated active-worker Stop | No transition; `continue:false` | Explicit recovery, no loop |
 | Zero-worker Stop | Remove session/recovery state | Final may pass |
 
-Duplicate `SubagentStart` and unrelated `SubagentStop` events do not create a
-new authorization. File locking serializes concurrent command-hook processes.
+Duplicate `SubagentStart`, unrelated `SubagentStop`, duplicate wait returns,
+and untracked or mismatched interrupt results do not create a new
+authorization. File locking serializes concurrent command-hook processes.
 Audit records contain only epoch/outcome/event plus SHA-256 identities for the
 session, turn, tool call, and agent when present; they retain at most 128
 records per session, 256 session files, and 14 days.

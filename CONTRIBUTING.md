@@ -22,7 +22,9 @@ Thanks for improving the event gate.
 Describe the observable behavior change, security implications, and test
 evidence. Runtime hook changes require maintainers to review and re-trust their
 local hook definitions after reinstalling; they do not automatically activate
-in existing Codex sessions.
+in existing Codex sessions. Exit every session that loaded the old snapshot
+before reinstalling from a plain shell: a live session retains its resolved
+cache path, which the reinstall may replace.
 
 ## Release discipline
 

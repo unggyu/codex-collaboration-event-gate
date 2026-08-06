@@ -37,6 +37,17 @@
             "statusMessage": "Checking Codex wait recovery"
           }
         ]
+      },
+      {
+        "matcher": "interrupt_agent$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/hooks/codex-collaboration-lifecycle.py\"",
+            "timeout": 3,
+            "statusMessage": "Recording exact Codex worker interruption"
+          }
+        ]
       }
     ],
     "PostToolUse": [
@@ -48,6 +59,28 @@
             "command": "python3 \"${PLUGIN_ROOT}/hooks/codex-collaboration-lifecycle.py\"",
             "timeout": 3,
             "statusMessage": "Reconciling Codex worker dispatch"
+          }
+        ]
+      },
+      {
+        "matcher": "wait_agent$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/hooks/codex-collaboration-lifecycle.py\"",
+            "timeout": 3,
+            "statusMessage": "Re-arming after a Codex wait event"
+          }
+        ]
+      },
+      {
+        "matcher": "interrupt_agent$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/hooks/codex-collaboration-lifecycle.py\"",
+            "timeout": 3,
+            "statusMessage": "Reconciling exact Codex worker interruption"
           }
         ]
       }

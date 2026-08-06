@@ -12,8 +12,14 @@ independent tasks run concurrently.
 After dispatch, call `wait_agent` exactly once. `PreToolUse` rewrites it to
 `3600000ms`; the native subscription consumes no model polling turns and
 remains interruptible by steered user input. When one worker completes or the
-user steers, reconcile that event before arming the one newly authorized wait.
-Never use short, repeated, or polling waits.
+wait returns for an intermediate message, or the user steers, reconcile that
+event before arming the one newly authorized wait. Never use short, repeated,
+or polling waits. A timeout does not authorize a retry.
+
+If a worker must be interrupted, call `interrupt_agent` for its exact native id
+or canonical task name. The gate removes only that bound target after the
+matching successful tool response; reconcile the interruption before waiting
+for any workers that remain.
 
 `Stop` never waits. If final is attempted with active workers, it returns
 immediately with one continuation that instructs the root to arm the authorized
@@ -27,12 +33,14 @@ complete. Never promise a passive wake after the parent turn has ended.
 
 This design spends one model/tool transition to arm each event subscription in
 exchange for keeping the composer responsive. Hooks can authorize a new wait
-after dispatch, completion, or `UserPromptSubmit` steering, but Codex exposes
-no hook API that can invoke `wait_agent` automatically; the root must make that
-tool call.
+after dispatch, completion, a correlated non-timeout wait return, a confirmed
+interruption, or `UserPromptSubmit` steering, but Codex exposes no hook API that
+can invoke `wait_agent` automatically; the root must make that tool call.
 
-After install or update, open `/hooks`, review the plugin source and exact
-command hashes, and trust them. Start a new Codex session after trust is
-recorded; an already-running session is not an activation test. Keep only one
-active copy: use either the installed plugin or a project-local vendored copy,
-never both.
+Before updating, exit every Codex session that loaded the current snapshot and
+run the reinstall from a plain shell. A live session retains its resolved cache
+path, which the reinstall may remove. After install or update, start a new
+Codex session, open `/hooks`, review the plugin source and exact command hashes,
+and trust them; an already-running session is not an activation test. Keep only
+one active copy: use either the installed plugin or a project-local vendored
+copy, never both.

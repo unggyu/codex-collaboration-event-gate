@@ -3,9 +3,11 @@
 
 Native subagent lifecycle events atomically maintain opaque session state in
 PLUGIN_DATA. One root wait_agent call is authorized per dispatch, completion,
-or steering event and is rewritten to the maximum supported timeout. Stop never
-waits: it immediately continues once to arm that interruptible subscription, or
-fails closed on a repeated final attempt while workers remain.
+non-timeout wait return, or steering event and is rewritten to the maximum
+supported timeout. Successful interrupt_agent calls reconcile only their exact
+tracked target. Stop never waits: it immediately continues once to arm that
+interruptible subscription, or fails closed on a repeated final attempt while
+workers remain.
 
 No transcript, project root, FIFO, polling loop, agent API, or external service
 is used.
@@ -26,13 +28,49 @@ import time
 from typing import Any, Iterator
 
 
-STATE_VERSION = 6
+STATE_VERSION = 7
 RECOVERY_VERSION = 2
 MAX_RECOVERY_WAIT_TIMEOUT_MS = 3_600_000
 SESSION_SOURCES = frozenset({"startup", "resume", "clear", "compact"})
 WAIT_AGENT_HOOK_NAMES = frozenset(
     {"wait_agent", "collaborationwait_agent", "multi_agent_v1wait_agent"}
 )
+INTERRUPT_AGENT_HOOK_NAMES = frozenset(
+    {
+        "interrupt_agent",
+        "collaborationinterrupt_agent",
+        "multi_agent_v1interrupt_agent",
+    }
+)
+INTERRUPT_SUCCESS_PREVIOUS_STATUSES = frozenset(
+    {
+        "cancelled",
+        "canceled",
+        "completed",
+        "errored",
+        "failed",
+        "interrupted",
+        "pending",
+        "running",
+        "shutdown",
+        "stopped",
+        "waiting",
+    }
+)
+INTERRUPT_TERMINAL_STATUSES = frozenset(
+    {
+        "cancelled",
+        "canceled",
+        "completed",
+        "errored",
+        "failed",
+        "interrupted",
+        "shutdown",
+        "stopped",
+    }
+)
+MAX_INTERRUPT_CAPABILITIES = 64
+MAX_TARGET_HASHES = 4
 MAX_AUDIT_RECORDS = 128
 MAX_AUDIT_FILES = 256
 AUDIT_RETENTION_SECONDS = 14 * 24 * 60 * 60
@@ -72,6 +110,22 @@ def opaque_id(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8", "surrogateescape")).hexdigest()
 
 
+def valid_digest(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def valid_target_hashes(value: Any) -> bool:
+    return (
+        isinstance(value, list)
+        and len(value) <= MAX_TARGET_HASHES
+        and all(valid_digest(item) for item in value)
+    )
+
+
 def state_paths(payload: dict[str, Any]) -> tuple[Path, Path, Path, Path]:
     session_id = text_field(payload, "session_id")
     if not session_id:
@@ -98,11 +152,13 @@ def new_state(session_id: str) -> dict[str, Any]:
     return {
         "dispatch_sequence": 0,
         "event_epoch": 0,
+        "interrupts": {},
         "last_event": "session",
         "pending": {},
         "session_hash": opaque_id(session_id),
         "stop_continuation_epoch": -1,
         "version": STATE_VERSION,
+        "wait_call_hash": "",
         "wait_issued_epoch": -1,
         "workers": {},
     }
@@ -136,6 +192,8 @@ def load_state(path: Path, session_id: str) -> tuple[dict[str, Any], bool]:
         or value.get("session_hash") != opaque_id(session_id)
         or not isinstance(value.get("workers"), dict)
         or not isinstance(value.get("pending"), dict)
+        or not isinstance(value.get("interrupts"), dict)
+        or len(value["interrupts"]) > MAX_INTERRUPT_CAPABILITIES
         or type(value.get("dispatch_sequence")) is not int
         or value["dispatch_sequence"] < 0
         or type(value.get("event_epoch")) is not int
@@ -144,6 +202,8 @@ def load_state(path: Path, session_id: str) -> tuple[dict[str, Any], bool]:
         or value["wait_issued_epoch"] < -1
         or type(value.get("stop_continuation_epoch")) is not int
         or value["stop_continuation_epoch"] < -1
+        or not isinstance(value.get("wait_call_hash"), str)
+        or (value["wait_call_hash"] and not valid_digest(value["wait_call_hash"]))
         or not isinstance(value.get("last_event"), str)
     ):
         raise StateCorruption("session state schema is invalid")
@@ -155,10 +215,11 @@ def load_state(path: Path, session_id: str) -> tuple[dict[str, Any], bool]:
             or not isinstance(worker.get("turn_id"), str)
             or not isinstance(worker.get("started_at"), (int, float))
             or not isinstance(worker.get("updated_at"), (int, float))
+            or not valid_target_hashes(worker.get("target_hashes"))
         ):
             raise StateCorruption("active-worker record is invalid")
     for call_id, pending in value["pending"].items():
-        if not isinstance(call_id, str) or not isinstance(pending, dict):
+        if not valid_digest(call_id) or not isinstance(pending, dict):
             raise StateCorruption("pending-dispatch state is invalid")
         if (
             not isinstance(pending.get("created_at"), (int, float))
@@ -167,8 +228,19 @@ def load_state(path: Path, session_id: str) -> tuple[dict[str, Any], bool]:
             or pending["sequence"] <= 0
             or not isinstance(pending.get("turn_hash"), str)
             or not isinstance(pending.get("outcome"), str)
+            or not valid_target_hashes(pending.get("target_hashes"))
         ):
             raise StateCorruption("pending-dispatch record is invalid")
+    for call_id, interrupt in value["interrupts"].items():
+        if not valid_digest(call_id) or not isinstance(interrupt, dict):
+            raise StateCorruption("interrupt capability state is invalid")
+        if (
+            not isinstance(interrupt.get("created_at"), (int, float))
+            or not valid_digest(interrupt.get("target_hash"))
+            or interrupt.get("work_kind") not in {"pending", "worker"}
+            or not isinstance(interrupt.get("work_key"), str)
+        ):
+            raise StateCorruption("interrupt capability record is invalid")
     return value, True
 
 
@@ -405,6 +477,13 @@ def is_wait_agent_hook_name(tool_name: str) -> bool:
     return tool_name.endswith("wait_agent") and tool_name in WAIT_AGENT_HOOK_NAMES
 
 
+def is_interrupt_agent_hook_name(tool_name: str) -> bool:
+    return (
+        tool_name.endswith("interrupt_agent")
+        and tool_name in INTERRUPT_AGENT_HOOK_NAMES
+    )
+
+
 def is_spawn_agent_hook_name(tool_name: str) -> bool:
     """Accept both the documented Agent alias and native collaboration names."""
     return tool_name == "Agent" or tool_name.lower().endswith("spawn_agent")
@@ -413,8 +492,99 @@ def is_spawn_agent_hook_name(tool_name: str) -> bool:
 def pending_key(payload: dict[str, Any]) -> str:
     tool_use_id = text_field(payload, "tool_use_id", 256)
     if not tool_use_id:
-        raise StateCorruption("spawn_agent is missing a tool-call identity")
+        raise StateCorruption("tracked tool is missing a tool-call identity")
     return opaque_id(tool_use_id)
+
+
+def response_object(response: Any) -> dict[str, Any] | None:
+    """Accept the documented JSON object or its local model-facing encoding."""
+    if isinstance(response, dict):
+        return response
+    if not isinstance(response, str) or len(response) > 4096:
+        return None
+    try:
+        value = json.loads(response)
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def spawn_target_hashes(tool_input: Any) -> list[str]:
+    if not isinstance(tool_input, dict):
+        return []
+    task_name = tool_input.get("task_name")
+    if not isinstance(task_name, str) or not task_name or len(task_name) > 512:
+        return []
+    targets = {task_name}
+    if not task_name.startswith("/"):
+        targets.add(f"/root/{task_name}")
+    return sorted(opaque_id(target) for target in targets)
+
+
+def response_target_hash(response: Any) -> str:
+    value = response_object(response)
+    if value is None:
+        return ""
+    task_name = value.get("task_name")
+    if not isinstance(task_name, str) or not task_name or len(task_name) > 512:
+        return ""
+    return opaque_id(task_name)
+
+
+def exact_work_target(
+    state: dict[str, Any], target: str
+) -> tuple[str, str] | None:
+    """Resolve one exact worker/pending target without FIFO fallback."""
+    target_hash = opaque_id(target)
+    matches: set[tuple[str, str]] = set()
+    if target in state["workers"]:
+        matches.add(("worker", target))
+    for agent_id, worker in state["workers"].items():
+        if target_hash in worker["target_hashes"]:
+            matches.add(("worker", agent_id))
+    for call_key, pending in state["pending"].items():
+        if target_hash in pending["target_hashes"]:
+            matches.add(("pending", call_key))
+    if len(matches) != 1:
+        return None
+    return next(iter(matches))
+
+
+def interrupt_response_confirms_terminal(response: Any) -> bool:
+    value = response_object(response)
+    if value is None:
+        return False
+    if (
+        value.get("isError") is True
+        or value.get("success") is False
+        or bool(value.get("error"))
+        or (
+            isinstance(value.get("type"), str)
+            and value["type"].lower() == "error"
+        )
+    ):
+        return False
+    status = value.get("status")
+    if (
+        value.get("success") is True
+        and isinstance(status, str)
+        and status.lower() in INTERRUPT_TERMINAL_STATUSES
+    ):
+        return True
+    previous_status = value.get("previous_status")
+    return (
+        isinstance(previous_status, str)
+        and previous_status.lower() in INTERRUPT_SUCCESS_PREVIOUS_STATUSES
+    )
+
+
+def wait_response_is_event(response: Any) -> bool:
+    value = response_object(response)
+    return (
+        value is not None
+        and not spawn_failure(value)
+        and value.get("timed_out") is False
+    )
 
 
 def oldest_pending(state: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
@@ -433,11 +603,12 @@ def oldest_pending(state: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
 
 def spawn_failure(response: Any) -> bool:
     """Only clear a capability on an explicit native tool failure."""
-    if not isinstance(response, dict):
+    value = response_object(response)
+    if value is None:
         return False
-    if response.get("isError") is True or response.get("success") is False:
+    if value.get("isError") is True or value.get("success") is False:
         return True
-    status = response.get("status")
+    status = value.get("status")
     if isinstance(status, str) and status.lower() in {
         "error",
         "failed",
@@ -445,9 +616,9 @@ def spawn_failure(response: Any) -> bool:
         "cancelled",
     }:
         return True
-    if isinstance(response.get("type"), str) and response["type"].lower() == "error":
+    if isinstance(value.get("type"), str) and value["type"].lower() == "error":
         return True
-    return bool(response.get("error"))
+    return bool(value.get("error"))
 
 
 def record_spawn_dispatch(payload: dict[str, Any]) -> dict[str, Any]:
@@ -474,6 +645,7 @@ def record_spawn_dispatch(payload: dict[str, Any]) -> dict[str, Any]:
                 "created_at": now,
                 "outcome": "prepared",
                 "sequence": state["dispatch_sequence"],
+                "target_hashes": spawn_target_hashes(payload.get("tool_input")),
                 "turn_hash": opaque_id(text_field(payload, "turn_id")),
                 "updated_at": now,
             }
@@ -534,6 +706,15 @@ def reconcile_spawn_dispatch(payload: dict[str, Any]) -> dict[str, Any]:
             )
             return {}
         state["pending"][call_key]["outcome"] = "accepted"
+        response_hash = response_target_hash(payload.get("tool_response"))
+        if (
+            response_hash
+            and response_hash not in state["pending"][call_key]["target_hashes"]
+            and len(state["pending"][call_key]["target_hashes"])
+            < MAX_TARGET_HASHES
+        ):
+            state["pending"][call_key]["target_hashes"].append(response_hash)
+            state["pending"][call_key]["target_hashes"].sort()
         state["pending"][call_key]["updated_at"] = time.time()
         write_state(state_path, state)
         audit_record(
@@ -545,6 +726,209 @@ def reconcile_spawn_dispatch(payload: dict[str, Any]) -> dict[str, Any]:
             tool_use_id=text_field(payload, "tool_use_id", 256),
         )
     return {}
+
+
+def interrupt_target(payload: dict[str, Any]) -> str:
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        raise StateCorruption("interrupt_agent tool_input is not an object")
+    target = tool_input.get("target")
+    if not isinstance(target, str) or not target or len(target) > 512:
+        raise StateCorruption("interrupt_agent target is invalid")
+    return target
+
+
+def record_interrupt_request(payload: dict[str, Any]) -> dict[str, Any]:
+    tool_name = text_field(payload, "tool_name", 128)
+    if not is_interrupt_agent_hook_name(tool_name):
+        return {}
+    session_id = text_field(payload, "session_id")
+    if not session_id:
+        raise StateCorruption("missing interrupt_agent session identity")
+    target = interrupt_target(payload)
+    call_key = pending_key(payload)
+    state_path, lock_path, _, audit_path = state_paths(payload)
+    with session_lock(lock_path):
+        state, existed = load_state(state_path, session_id)
+        matched = exact_work_target(state, target) if existed else None
+        if matched is None:
+            audit_record(
+                audit_path,
+                payload,
+                "PreToolUse",
+                "interrupt-denied-unmatched",
+                epoch=state["event_epoch"],
+                tool_use_id=text_field(payload, "tool_use_id", 256),
+            )
+            return wait_denial(
+                "interrupt_agent is blocked because its target does not match "
+                "exactly one tracked worker or pending dispatch. Do not retry; "
+                "use one-shot list_agents for diagnosis and reconcile the "
+                "target identity before interrupting."
+            )
+        existing = state["interrupts"].get(call_key)
+        if existing is not None and (
+            existing["target_hash"] != opaque_id(target)
+            or (existing["work_kind"], existing["work_key"]) != matched
+        ):
+            audit_record(
+                audit_path,
+                payload,
+                "PreToolUse",
+                "interrupt-denied-call-reuse",
+                epoch=state["event_epoch"],
+                tool_use_id=text_field(payload, "tool_use_id", 256),
+            )
+            return wait_denial(
+                "interrupt_agent is blocked because its tool-call identity was "
+                "already bound to a different tracked target. Do not retry; "
+                "reconcile the original interruption result."
+            )
+        if existing is None:
+            if len(state["interrupts"]) >= MAX_INTERRUPT_CAPABILITIES:
+                return wait_denial(
+                    "interrupt_agent is blocked because the bounded interrupt "
+                    "capability set is full. Do not retry; reconcile prior "
+                    "interrupt results first."
+                )
+            state["interrupts"][call_key] = {
+                "created_at": time.time(),
+                "target_hash": opaque_id(target),
+                "work_key": matched[1],
+                "work_kind": matched[0],
+            }
+            write_state(state_path, state)
+            outcome = "interrupt-recorded"
+        else:
+            outcome = "interrupt-duplicate"
+        audit_record(
+            audit_path,
+            payload,
+            "PreToolUse",
+            outcome,
+            epoch=state["event_epoch"],
+            tool_use_id=text_field(payload, "tool_use_id", 256),
+        )
+    return {}
+
+
+def reconcile_interrupt(payload: dict[str, Any]) -> dict[str, Any]:
+    tool_name = text_field(payload, "tool_name", 128)
+    if not is_interrupt_agent_hook_name(tool_name):
+        return {}
+    session_id = text_field(payload, "session_id")
+    if not session_id:
+        raise StateCorruption("missing interrupt_agent PostToolUse identity")
+    target = interrupt_target(payload)
+    call_key = pending_key(payload)
+    state_path, lock_path, _, audit_path = state_paths(payload)
+    removed = False
+    remaining = False
+    removed_agent = ""
+    with session_lock(lock_path):
+        state, existed = load_state(state_path, session_id)
+        capability = state["interrupts"].pop(call_key, None) if existed else None
+        if capability is None:
+            outcome = "interrupt-untracked"
+        elif capability["target_hash"] != opaque_id(target):
+            outcome = "interrupt-target-mismatch"
+            write_state(state_path, state)
+        elif not interrupt_response_confirms_terminal(payload.get("tool_response")):
+            outcome = "interrupt-unconfirmed"
+            write_state(state_path, state)
+        else:
+            matched = exact_work_target(state, target)
+            expected = (capability["work_kind"], capability["work_key"])
+            if matched != expected:
+                outcome = "interrupt-target-changed"
+                write_state(state_path, state)
+            else:
+                if matched[0] == "worker":
+                    state["workers"].pop(matched[1], None)
+                    removed_agent = matched[1]
+                    outcome = "interrupt-worker"
+                else:
+                    state["pending"].pop(matched[1], None)
+                    outcome = "interrupt-pending"
+                advance_event(state, "interrupted")
+                remaining = has_active_work(state)
+                write_state(state_path, state)
+                removed = True
+        audit_record(
+            audit_path,
+            payload,
+            "PostToolUse",
+            outcome,
+            epoch=state["event_epoch"],
+            agent_id=removed_agent,
+            tool_use_id=text_field(payload, "tool_use_id", 256),
+        )
+    if not removed:
+        return {}
+    context = "The exact interrupted target was removed from tracked work. "
+    if remaining:
+        context += (
+            "Other workers remain; reconcile this result, then arm the one "
+            "newly authorized wait_agent."
+        )
+    else:
+        context += "No tracked work remains; reconcile results and finish normally."
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "additionalContext": context,
+        }
+    }
+
+
+def reconcile_wait_return(payload: dict[str, Any]) -> dict[str, Any]:
+    tool_name = text_field(payload, "tool_name", 128)
+    if not is_wait_agent_hook_name(tool_name):
+        return {}
+    session_id = text_field(payload, "session_id")
+    if not session_id:
+        raise StateCorruption("missing wait_agent PostToolUse identity")
+    call_key = pending_key(payload)
+    state_path, lock_path, _, audit_path = state_paths(payload)
+    rearmed = False
+    with session_lock(lock_path):
+        state, existed = load_state(state_path, session_id)
+        if not existed or state["wait_call_hash"] != call_key:
+            outcome = "wait-return-untracked"
+        else:
+            state["wait_call_hash"] = ""
+            if (
+                wait_response_is_event(payload.get("tool_response"))
+                and has_active_work(state)
+            ):
+                advance_event(state, "wait-returned-event")
+                rearmed = True
+                outcome = "wait-return-rearmed"
+            elif has_active_work(state):
+                outcome = "wait-return-no-event"
+            else:
+                outcome = "wait-return-idle"
+            write_state(state_path, state)
+        audit_record(
+            audit_path,
+            payload,
+            "PostToolUse",
+            outcome,
+            epoch=state["event_epoch"],
+            tool_use_id=text_field(payload, "tool_use_id", 256),
+        )
+    if not rearmed:
+        return {}
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "additionalContext": (
+                "The native wait returned for a non-timeout event while tracked "
+                "work remains. Reconcile every delivered MESSAGE/FINAL/error, "
+                "then arm exactly one newly authorized wait_agent."
+            ),
+        }
+    }
 
 
 def session_start(payload: dict[str, Any]) -> dict[str, Any]:
@@ -566,10 +950,13 @@ def session_start(payload: dict[str, Any]) -> dict[str, Any]:
                 "dispatching bounded native workers, call wait_agent once; it "
                 "will be rewritten to 3600000ms and remains interruptible by "
                 "steered user input. Never poll or repeat a wait without a new "
-                "dispatch, worker completion, or steering event. Stop returns "
-                "immediately and denies final while workers remain. Reconcile "
-                "native FINAL/error results before final and never promise a "
-                "passive post-final wake. Workers must not spawn workers."
+                "dispatch, worker completion, non-timeout wait return, confirmed "
+                "interruption, or steering event. interrupt_agent removes only "
+                "its exact tracked target after a matching successful response. "
+                "Stop returns immediately and denies final while workers remain. "
+                "Reconcile native MESSAGE/FINAL/error results before final and "
+                "never promise a passive post-final wake. Workers must not spawn "
+                "workers."
             ),
         }
     }
@@ -590,6 +977,7 @@ def guard_wait_agent(payload: dict[str, Any]) -> dict[str, Any]:
     session_id = text_field(payload, "session_id")
     if not session_id:
         raise StateCorruption("missing PreToolUse session identity")
+    call_key = pending_key(payload)
     state_path, lock_path, recovery_path, audit_path = state_paths(payload)
     with session_lock(lock_path):
         control, _ = load_recovery_control(recovery_path, session_id)
@@ -604,6 +992,7 @@ def guard_wait_agent(payload: dict[str, Any]) -> dict[str, Any]:
                 state, _ = load_state(state_path, session_id)
                 if has_active_work(state):
                     state["wait_issued_epoch"] = state["event_epoch"]
+                    state["wait_call_hash"] = call_key
                     write_state(state_path, state)
             except Exception:
                 pass
@@ -613,8 +1002,8 @@ def guard_wait_agent(payload: dict[str, Any]) -> dict[str, Any]:
             return wait_allow(
                 tool_input,
                 "One failure-recovery wait was consumed and rewritten to "
-                "3600000ms. Do not call wait_agent again without a lifecycle "
-                "or steering event.",
+                "3600000ms. Do not call wait_agent again without a newly "
+                "authorized lifecycle, tool-return, or steering event.",
             )
         state, _ = load_state(state_path, session_id)
         if not has_active_work(state):
@@ -641,9 +1030,11 @@ def guard_wait_agent(payload: dict[str, Any]) -> dict[str, Any]:
             return wait_denial(
                 "The one wait_agent authorization for the current lifecycle "
                 "event was already consumed. Do not retry or poll. Re-arm only "
-                "after a new dispatch, worker completion, or steered user input."
+                "after a new dispatch, worker completion, non-timeout wait "
+                "return, confirmed interruption, or steered user input."
             )
         state["wait_issued_epoch"] = state["event_epoch"]
+        state["wait_call_hash"] = call_key
         write_state(state_path, state)
         audit_record(
             audit_path,
@@ -656,8 +1047,8 @@ def guard_wait_agent(payload: dict[str, Any]) -> dict[str, Any]:
             tool_input,
             "The event subscription was rewritten to 3600000ms. It consumes "
             "no model polling turns and remains interruptible by steered user "
-            "input. Reconcile the returned completion or steering event before "
-            "arming another authorized wait.",
+            "input. Reconcile every returned MESSAGE/FINAL/error or steering "
+            "event before arming another authorized wait.",
         )
 
 
@@ -675,6 +1066,13 @@ def update_subagent(payload: dict[str, Any]) -> dict[str, Any]:
         if event == "SubagentStart":
             now = time.time()
             is_new = agent_id not in state["workers"]
+            matched = oldest_pending(state) if is_new else None
+            if not is_new:
+                target_hashes = state["workers"][agent_id]["target_hashes"]
+            elif matched is not None:
+                target_hashes = list(matched[1]["target_hashes"])
+            else:
+                target_hashes = [opaque_id(agent_id)]
             state["workers"][agent_id] = {
                 "agent_type": text_field(payload, "agent_type"),
                 "started_at": (
@@ -682,11 +1080,11 @@ def update_subagent(payload: dict[str, Any]) -> dict[str, Any]:
                     if is_new
                     else state["workers"][agent_id]["started_at"]
                 ),
+                "target_hashes": target_hashes,
                 "turn_id": text_field(payload, "turn_id"),
                 "updated_at": now,
             }
             if is_new:
-                matched = oldest_pending(state)
                 if matched is not None:
                     state["pending"].pop(matched[0], None)
                     outcome = "start-promoted-pending"
@@ -858,8 +1256,8 @@ def stop_gate(payload: dict[str, Any]) -> dict[str, Any]:
                 "exactly one wait_agent now; PreToolUse will rewrite it to "
                 "3600000ms. The native subscription uses no model polling turns "
                 "and steered user input can interrupt it. Reconcile every "
-                "returned FINAL/error or steering event before another wait, "
-                "and never promise a passive post-final wake."
+                "returned MESSAGE/FINAL/error or steering event before another "
+                "wait, and never promise a passive post-final wake."
             ),
         }
 
@@ -890,11 +1288,19 @@ def update_for_event(payload: dict[str, Any]) -> dict[str, Any]:
     if event == "SessionStart":
         return session_start(payload)
     if event == "PreToolUse":
-        if is_spawn_agent_hook_name(text_field(payload, "tool_name", 128)):
+        tool_name = text_field(payload, "tool_name", 128)
+        if is_spawn_agent_hook_name(tool_name):
             return record_spawn_dispatch(payload)
+        if is_interrupt_agent_hook_name(tool_name):
+            return record_interrupt_request(payload)
         return guard_wait_agent(payload)
     if event == "PostToolUse":
-        return reconcile_spawn_dispatch(payload)
+        tool_name = text_field(payload, "tool_name", 128)
+        if is_spawn_agent_hook_name(tool_name):
+            return reconcile_spawn_dispatch(payload)
+        if is_interrupt_agent_hook_name(tool_name):
+            return reconcile_interrupt(payload)
+        return reconcile_wait_return(payload)
     if event in {"SubagentStart", "SubagentStop"}:
         return update_subagent(payload)
     if event == "UserPromptSubmit":
@@ -921,9 +1327,16 @@ def main() -> int:
     except Exception:
         event = text_field(payload, "hook_event_name")
         if event == "PreToolUse":
+            tool_name = text_field(payload, "tool_name", 128)
+            if is_interrupt_agent_hook_name(tool_name):
+                guarded_tool = "interrupt_agent"
+            elif is_spawn_agent_hook_name(tool_name):
+                guarded_tool = "spawn_agent"
+            else:
+                guarded_tool = "wait_agent"
             emit(
                 wait_denial(
-                    "wait_agent guard failed closed because session state could "
+                    f"{guarded_tool} guard failed closed because session state could "
                     "not be verified. Do not retry; attempt final so Stop can "
                     "authorize exactly one explicit recovery path."
                 )

@@ -1,7 +1,7 @@
 {
   "name": "codex-collaboration-event-gate",
-  "version": "0.1.0+codex.20260805213945",
-  "description": "Coordinate native Codex subagents with one interruptible event subscription and no polling.",
+  "version": "0.1.0+codex.20260806215701",
+  "description": "Coordinate native Codex subagents with exact interruption tracking and one event subscription.",
   "author": {
     "name": "codex-collaboration-event-gate contributors"
   },
@@ -19,7 +19,7 @@
   "interface": {
     "displayName": "Codex Collaboration Event Gate",
     "shortDescription": "Event-driven completion gate for Codex subagents",
-    "longDescription": "Tracks native Codex subagent lifecycle events, rewrites one authorized wait to the maximum timeout, preserves user steering, and denies final while workers remain.",
+    "longDescription": "Tracks native Codex subagent lifecycle and exact interruption events, re-arms one authorized non-polling wait after native events, preserves user steering, and denies final while workers remain.",
     "developerName": "codex-collaboration-event-gate contributors",
     "category": "Productivity",
     "capabilities": [

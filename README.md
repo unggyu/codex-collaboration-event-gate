@@ -77,15 +77,25 @@ parent-call correlation ID, the pairing strategy should be revisited.
 There is no external registrar: Codex plugins expose no manifest command/tool
 surface that can safely receive the hook-only `PLUGIN_DATA`. The callable
 new-session protocol is ordinary root `spawn_agent` followed by `wait_agent`.
-Every root dispatch message must include `LEDGER_LANE: <stable lane id>`,
-`LEDGER_SLOT_CAPACITY: <1-64>`, and the batch's
-`LEDGER_CURRENT_ACTIVE: <1-64>` as well as the existing classification,
-parallelism, gate, model, and fork metadata. On the first normal root
-`wait_agent`, `PreToolUse` constructs the fresh ledger atomically from those
-same-session pending/active dispatch capabilities and checks the declared
-active count against tracked work; no caller supplies a session identity or
-capability. After a verified wait, lifecycle events refresh the surviving
-bound count inside the hook before the next epoch; callers cannot refresh it.
+Codex Multi-Agent V2 encrypts `spawn_agent.message` before the blocking hook
+sees it. V2 callers therefore place the fixed non-secret coordination
+declaration in the visible task name:
+
+```text
+cceg1_<n|u>_<r|w>_<lane>_<capacity>_<active>_<d|h|u>
+```
+
+The codes mean non-UI/UI, read-only/isolated-write, a unique lowercase
+alphanumeric lane of at most 32 characters, bounded decimal capacity and
+active count, and default/novel-high-UI/user-requested-Sol policy. A one-worker
+read-only example is `cceg1_n_r_isolatedsmoke_1_1_d`. The native `model` and
+`fork_turns` fields remain explicit. Plaintext V1 callers retain the fixed
+message-header form. On the first normal root `wait_agent`, `PreToolUse`
+constructs the fresh ledger atomically from those same-session pending/active
+dispatch capabilities and checks the declared active count against tracked
+work; no caller supplies a session identity or filesystem capability. After a
+verified wait, lifecycle events refresh the surviving bound count inside the
+hook before the next epoch; callers cannot refresh it.
 
 Every tracked active or pending dispatch must map to exactly one declared lane.
 Missing, duplicate, and phantom mappings fail closed. Exact active
@@ -99,17 +109,20 @@ Gate strings are exact. Supported contracts include `git-ref:origin/qa`,
 `production-deploy:<service>`. Two planned/active QA ref writers conflict; QA
 and develop ref writers do not.
 
-When spawn metadata is present, the hook parses only fixed headers:
-`CLASSIFICATION`, `PARALLELISM_CLASS`, `EXCLUSIVE_GATE`,
-`NOVEL_UI_COMPLEXITY`, `SOL_OVERRIDE_REASON`, `LEDGER_LANE`,
-`LEDGER_SLOT_CAPACITY`, and `LEDGER_CURRENT_ACTIVE`, plus native `model` and
-`fork_turns`. Non-UI requires explicit `gpt-5.6-terra`; `fork_turns=all` is
-rejected; Sol requires novel high-complexity UI or
-`SOL_OVERRIDE_REASON: user-requested|terra-blocked:<specific evidence>`.
-Missing or invalid fixed headers are reported as a bounded input-contract
-denial naming the first invalid field. The root may correct that declaration
-and retry the same dispatch once; it is not reported as lifecycle-state
-corruption and does not authorize a recovery wait.
+For plaintext V1, the hook parses only fixed headers: `CLASSIFICATION`,
+`PARALLELISM_CLASS`, `EXCLUSIVE_GATE`, `NOVEL_UI_COMPLEXITY`,
+`SOL_OVERRIDE_REASON`, `LEDGER_LANE`, `LEDGER_SLOT_CAPACITY`, and
+`LEDGER_CURRENT_ACTIVE`. For encrypted V2, it parses only the strict `cceg1_`
+task-name capability and rejects an opaque message without one. V2 capabilities
+support read-only and isolated-write work; exact exclusive gates and
+`terra-blocked:<specific evidence>` fail closed because the hook cannot verify
+their encrypted plaintext values. Non-UI still requires explicit
+`gpt-5.6-terra`; `fork_turns=all` is rejected; Sol requires the supported
+novel-high-UI or user-requested capability. Mixing the two metadata surfaces is
+rejected. Missing or invalid declarations are reported as a bounded
+input-contract denial naming the first invalid field. The root may correct that
+declaration and retry the same dispatch once; it is not reported as
+lifecycle-state corruption and does not authorize a recovery wait.
 Unpaired lifecycle events have no spawn metadata, so the hook records that
 boundary instead of inventing a cross-check.
 

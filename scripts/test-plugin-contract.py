@@ -89,6 +89,14 @@ assert "hook_owned_ledger" in source and "validate_ledger_coverage" in source
 assert "register-coordination-ledger" not in source
 print("PASS: new sessions use the hook-owned callable registration protocol.")
 
+assert "V2_TASK_CAPABILITY" in source
+assert "FERNET_SHAPED_MESSAGE" in source
+assert "cceg1_<n|u>_<r|w>" in source
+for guidance in (README.read_text(encoding="utf-8"), SKILL.read_text(encoding="utf-8")):
+    assert "cceg1_<n|u>_<r|w>" in guidance
+    assert "encrypts" in guidance
+print("PASS: encrypted Multi-Agent V2 uses the visible fail-closed task-name capability.")
+
 for contract in (
     "LEGACY_STATE_VERSIONS",
     "migrate_v7_state",

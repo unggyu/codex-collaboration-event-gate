@@ -4,6 +4,12 @@ All notable changes to this project are documented here.
 
 ## Unreleased
 
+- Support Codex Multi-Agent V2's encrypted `spawn_agent.message` boundary with
+  a strict visible `cceg1_` task-name capability for non-secret coordination
+  metadata; retain plaintext fixed headers for V1.
+- Fail closed before state mutation for encrypted V2 dispatches with a missing
+  or malformed capability, mixed metadata surfaces, or policies whose exact
+  gate/evidence value is not visible to the local hook.
 - Persist a valid empty v12 state during a brand-new `SessionStart` instead of
   leaving only its lock file.
 - Report missing or invalid root spawn declarations as correctable

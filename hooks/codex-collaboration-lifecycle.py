@@ -103,6 +103,11 @@ PROMPT_METADATA = re.compile(
     r"SOL_OVERRIDE_REASON|NOVEL_UI_COMPLEXITY|LEDGER_LANE|"
     r"LEDGER_SLOT_CAPACITY|LEDGER_CURRENT_ACTIVE)\s*:\s*([^\r\n]{1,512})\s*$"
 )
+V2_TASK_CAPABILITY = re.compile(
+    r"^cceg1_(n|u)_(r|w)_([a-z0-9]{1,32})_"
+    r"([1-9][0-9]?)_([1-9][0-9]?)_(d|h|u)$"
+)
+FERNET_SHAPED_MESSAGE = re.compile(r"^gAAAA[A-Za-z0-9_-]{32,32763}={0,2}$")
 OPERATOR_RECOVERY_PREFIX = "/collaboration-recover-empty"
 OPERATOR_RECOVERY_CONFIRMATION = "confirm-native-root-only"
 
@@ -970,6 +975,46 @@ def prompt_metadata(tool_input: Any) -> tuple[dict[str, str], list[str]]:
     return values, gates
 
 
+def v2_task_metadata(tool_input: Any) -> dict[str, str] | None:
+    """Decode fixed metadata from the visible V2 task-name capability."""
+    if not isinstance(tool_input, dict):
+        return None
+    task_name = tool_input.get("task_name")
+    if not isinstance(task_name, str) or not task_name.startswith("cceg1_"):
+        return None
+    matched = V2_TASK_CAPABILITY.fullmatch(task_name)
+    if matched is None:
+        raise StateCorruption(
+            "V2 task_name capability must match "
+            "cceg1_<n|u>_<r|w>_<lane>_<capacity>_<active>_<d|h|u>"
+        )
+    classification, parallelism, lane, capacity, active, sol_policy = (
+        matched.groups()
+    )
+    values = {
+        "CLASSIFICATION": {"n": "non-UI", "u": "UI"}[classification],
+        "PARALLELISM_CLASS": {
+            "r": "read-only",
+            "w": "isolated-write",
+        }[parallelism],
+        "LEDGER_LANE": lane,
+        "LEDGER_SLOT_CAPACITY": capacity,
+        "LEDGER_CURRENT_ACTIVE": active,
+    }
+    if sol_policy == "h":
+        values["NOVEL_UI_COMPLEXITY"] = "high"
+    elif sol_policy == "u":
+        values["SOL_OVERRIDE_REASON"] = "user-requested"
+    return values
+
+
+def has_opaque_v2_message(tool_input: Any) -> bool:
+    if not isinstance(tool_input, dict):
+        return False
+    message = tool_input.get("message")
+    return isinstance(message, str) and FERNET_SHAPED_MESSAGE.fullmatch(message) is not None
+
+
 def model_class(model: str) -> str:
     if model == "gpt-5.6-terra":
         return "terra"
@@ -1005,7 +1050,21 @@ def ledger_integer(value: str, field: str, minimum: int, maximum: int) -> int:
 
 def spawn_metadata(tool_input: Any) -> dict[str, Any]:
     """Parse only fixed coordination metadata; never persist the prompt."""
-    values, prompt_gates = prompt_metadata(tool_input)
+    task_values = v2_task_metadata(tool_input)
+    prompt_values, prompt_gates = prompt_metadata(tool_input)
+    if task_values is not None:
+        if prompt_values or prompt_gates:
+            raise StateCorruption(
+                "V2 task_name capability must not be combined with plaintext "
+                "coordination headers"
+            )
+        values = task_values
+    else:
+        if has_opaque_v2_message(tool_input):
+            raise StateCorruption(
+                "encrypted V2 message requires a visible cceg1 task_name capability"
+            )
+        values = prompt_values
     classification = values.get("CLASSIFICATION", "").lower()
     classification = {"ui": "ui", "non-ui": "non-ui"}.get(
         classification, "invalid"
@@ -1994,10 +2053,12 @@ def session_start(payload: dict[str, Any]) -> dict[str, Any]:
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
             "additionalContext": recovery_context or (
-                "The interactive collaboration event gate is active. After "
-                "dispatching bounded native workers with LEDGER_LANE, "
-                "LEDGER_SLOT_CAPACITY, and LEDGER_CURRENT_ACTIVE headers, call "
-                "wait_agent once. Its PreToolUse hook atomically registers the "
+                "The interactive collaboration event gate is active. Codex V2 "
+                "encrypts spawn messages, so use the visible task_name capability "
+                "cceg1_<n|u>_<r|w>_<lane>_<capacity>_<active>_<d|h|u>; plaintext "
+                "V1 may use the fixed coordination headers. After dispatching "
+                "bounded native workers, call wait_agent once. Its PreToolUse "
+                "hook atomically registers the "
                 "session-bound ledger from those root dispatch capabilities, "
                 "checks the declared active count against observed dispatches, "
                 "and rewrites the wait to 3600000ms; it remains interruptible by "

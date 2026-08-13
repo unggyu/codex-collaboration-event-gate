@@ -73,6 +73,7 @@ def root_spawn(
     fork="none",
     novel=False,
     override="",
+    encrypted_v2=False,
 ):
     lines = [
         f"CLASSIFICATION: {classification}",
@@ -87,10 +88,21 @@ def root_spawn(
         lines.append("NOVEL_UI_COMPLEXITY: high")
     if override:
         lines.append(f"SOL_OVERRIDE_REASON: {override}")
+    explicit_task = task
     task = task or f"task-{lane}"
+    message = "\n".join(lines)
+    if encrypted_v2:
+        classification_code = {"non-UI": "n", "UI": "u"}[classification]
+        parallelism_code = {"read-only": "r", "isolated-write": "w"}[pclass]
+        sol_policy = "h" if novel else "u" if override == "user-requested" else "d"
+        task = explicit_task or (
+            f"cceg1_{classification_code}_{parallelism_code}_{lane}_"
+            f"{capacity}_{active}_{sol_policy}"
+        )
+        message = "gAAAA" + "A" * 96
     tool_input = {
         "task_name": task,
-        "message": "\n".join(lines),
+        "message": message,
         "fork_turns": fork,
     }
     if model is not None:
@@ -151,7 +163,7 @@ started = invoke(
     {"hook_event_name": "SessionStart", "session_id": name, "source": "startup"},
     name,
 )
-assert "LEDGER_LANE" in started["hookSpecificOutput"]["additionalContext"]
+assert "cceg1" in started["hookSpecificOutput"]["additionalContext"]
 first = root_spawn(name, "lane-one", capacity=2, active=2)
 second = root_spawn(name, "lane-two", capacity=2, active=2)
 assert first[0] == second[0] == {}
@@ -165,6 +177,111 @@ assert snapshot["ledger"]["active_count"] == 2
 assert len(snapshot["ledger"]["lanes"]) == 2
 assert name not in state_file(name).read_text(encoding="utf-8")
 print("PASS: a fresh session registers through root spawn PreToolUse then allows wait_agent without a callable helper.")
+
+
+# Codex Multi-Agent V2 encrypts spawn_agent.message before PreToolUse. The
+# visible task_name capability therefore carries only the fixed, non-secret
+# coordination declaration. It must drive the same spawn -> wait -> completion
+# -> final-release lifecycle without decrypting or retaining task content.
+name = "encrypted-v2-activation"
+started = invoke(
+    {"hook_event_name": "SessionStart", "session_id": name, "source": "startup"},
+    name,
+)
+assert "cceg1" in started["hookSpecificOutput"]["additionalContext"]
+encrypted = root_spawn(
+    name,
+    "isolatedsmoke",
+    capacity=1,
+    active=1,
+    encrypted_v2=True,
+)
+assert encrypted[0] == {}, encrypted[0]
+accept_and_start(name, encrypted, "encrypted-worker")
+allowed = wait(name, "encrypted-wait")
+assert permission(allowed) == "allow", allowed
+assert allowed["hookSpecificOutput"]["updatedInput"]["timeout_ms"] == 3_600_000
+assert invoke(event("SubagentStop", name, agent="encrypted-worker"), name) == {}
+assert invoke(event("Stop", name), name) == {}
+assert not list((tmp_root / name / "sessions").glob("*.json"))
+print("PASS: encrypted V2 dispatch uses a visible task capability and releases final after completion.")
+
+
+name = "encrypted-v2-missing-capability"
+denied, _, _, _ = root_spawn(
+    name,
+    "isolatedsmoke",
+    capacity=1,
+    active=1,
+    task="ordinary_task",
+    encrypted_v2=True,
+)
+assert permission(denied) == "deny", denied
+assert "encrypted V2 message requires a visible cceg1" in denied["hookSpecificOutput"]["permissionDecisionReason"]
+assert not list((tmp_root / name / "sessions").glob("*.json"))
+
+name = "encrypted-v2-malformed-capability"
+denied = invoke(
+    event(
+        "PreToolUse",
+        name,
+        tool_name="Agent",
+        tool_input={
+            "task_name": "cceg1_n_x_unsupported_1_1_d",
+            "message": "gAAAA" + "A" * 96,
+            "model": "gpt-5.6-terra",
+            "fork_turns": "none",
+        },
+        call="spawn-malformed",
+    ),
+    name,
+)
+assert permission(denied) == "deny", denied
+assert "V2 task_name capability must match" in denied["hookSpecificOutput"]["permissionDecisionReason"]
+assert not list((tmp_root / name / "sessions").glob("*.json"))
+
+name = "encrypted-v2-mixed-metadata"
+denied = invoke(
+    event(
+        "PreToolUse",
+        name,
+        tool_name="Agent",
+        tool_input={
+            "task_name": "cceg1_n_r_mixedmetadata_1_1_d",
+            "message": "\n".join(
+                (
+                    "CLASSIFICATION: non-UI",
+                    "PARALLELISM_CLASS: read-only",
+                    "LEDGER_LANE: mixedmetadata",
+                    "LEDGER_SLOT_CAPACITY: 1",
+                    "LEDGER_CURRENT_ACTIVE: 1",
+                )
+            ),
+            "model": "gpt-5.6-terra",
+            "fork_turns": "none",
+        },
+        call="spawn-mixed",
+    ),
+    name,
+)
+assert permission(denied) == "deny", denied
+assert "must not be combined" in denied["hookSpecificOutput"]["permissionDecisionReason"]
+
+name = "encrypted-v2-novel-ui-sol"
+allowed, _, _, _ = root_spawn(
+    name,
+    "noveluisol",
+    capacity=1,
+    active=1,
+    model="gpt-5.6-sol",
+    classification="UI",
+    novel=True,
+    encrypted_v2=True,
+)
+assert allowed == {}, allowed
+print("PASS: encrypted V2 capabilities reject ambiguity and retain narrow Sol policy.")
+
+name = "fresh-root-activation"
 
 
 # Exact audit repro: a count of two with only worker one mapped used to permit

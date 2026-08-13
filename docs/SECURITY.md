@@ -75,11 +75,17 @@ the hook cannot call the native registry itself.
 
 The hook never exposes `PLUGIN_DATA` or a registrar command to the model. It
 constructs the ledger only from fixed metadata in root `spawn_agent` payloads
-and same-session pending/active capabilities, derives active count from the
-observed dispatches, and fails closed when a lane is missing, duplicate,
-phantom, over capacity, or inconsistent with observed metadata. Unpaired
-native lifecycle events have no parent spawn payload; that is an explicit
-verification boundary, not a guessed policy assertion.
+and same-session pending/active capabilities. Plaintext V1 metadata comes from
+fixed message headers. Multi-Agent V2 encrypts `message` before `PreToolUse`,
+so the hook accepts only the visible, strict `cceg1_` task-name capability; it
+does not decrypt, persist, or recover task content from a transcript. An opaque
+V2 message without that capability, a malformed capability, mixed metadata
+surfaces, and V2 policies requiring an exact encrypted gate/evidence value all
+fail closed before state mutation. The hook derives active count from observed
+dispatches and fails closed when a lane is missing, duplicate, phantom, over
+capacity, or inconsistent with observed metadata. Unpaired native lifecycle
+events have no parent spawn payload; that is an explicit verification boundary,
+not a guessed policy assertion.
 Malformed fixed spawn declarations are denied before state mutation with a
 bounded, constant-family validation reason. Correcting and retrying that one
 dispatch cannot mint a recovery wait or bypass lifecycle validation.

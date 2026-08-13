@@ -138,14 +138,17 @@ must issue the next tool call.
 
 The only callable registration surface that a newly activated Codex session
 actually has is the root's normal `spawn_agent` call. Each root dispatch
-therefore declares `LEDGER_LANE`, `LEDGER_SLOT_CAPACITY`, and a shared
-`LEDGER_CURRENT_ACTIVE` in addition to its fixed coordination metadata. On the
-first normal `wait_agent`, the hook binds those declarations to its
-same-session pending/active dispatch capabilities, verifies the declared count
-against the observed count, and retains only hashes. After a verified ledger,
-lifecycle events refresh only the surviving bound count inside the hook for the
-next epoch. A caller cannot provide a session id, filesystem path, or
-registration capability.
+therefore declares the lane, shared capacity, active count, classification, and
+parallelism policy in a fixed non-secret surface. Plaintext V1 uses the legacy
+message headers. Multi-Agent V2 marks `message` encrypted before local
+`PreToolUse`, so it uses the visible strict task-name capability
+`cceg1_<n|u>_<r|w>_<lane>_<capacity>_<active>_<d|h|u>`. On the first normal
+`wait_agent`, the hook binds those declarations to its same-session
+pending/active dispatch capabilities, verifies the declared count against the
+observed count, and retains only hashes. After a verified ledger, lifecycle
+events refresh only the surviving bound count inside the hook for the next
+epoch. A caller cannot provide a session id, filesystem path, or registration
+capability.
 
 Every tracked active/pending native dispatch must bind to exactly one active
 lane. The hook rejects missing coverage, multiple lane mappings for one
@@ -161,11 +164,17 @@ work exceeds its declared capacity, or whose exact active exclusive gates
 conflict. Deferral/dependency planning remains outside the hook protocol: only
 already-dispatched native work is authorization-relevant.
 
-For native spawn payloads, the hook can inspect `model`, `fork_turns`, and fixed
-coordination headers in the spawn message. It enforces explicit Terra for
-non-UI, rejects `fork_turns=all`, and narrowly permits Sol. Current unpaired
-native lifecycle events do not expose a parent spawn payload; the hook does not
-invent missing metadata and records that verification boundary instead.
+For native spawn payloads, the hook can inspect visible `model`, `fork_turns`,
+and `task_name`. It parses plaintext fixed message headers only when they are
+actually visible. A Fernet-shaped V2 message without a valid `cceg1_`
+capability fails closed; the hook never decrypts it or reads a transcript. The
+V2 grammar supports read-only and isolated-write dispatches and the two
+locally-verifiable Sol policies. Exact exclusive gates and
+`terra-blocked:<evidence>` remain plaintext-V1-only because V2 exposes no
+locally verifiable value. The hook enforces explicit Terra for non-UI, rejects
+`fork_turns=all`, and narrowly permits Sol. Current unpaired native lifecycle
+events do not expose a parent spawn payload; the hook does not invent missing
+metadata and records that verification boundary instead.
 
 Fixed spawn declarations are validated before lifecycle state is read or
 mutated. A missing or invalid declaration produces a specific input-contract

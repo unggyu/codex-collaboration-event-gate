@@ -17,10 +17,12 @@ uses private plugin-data directories, regular-file checks, atomic writes,
 file locks, schema validation, hashed audit identifiers, and fail-closed
 decisions when active-worker state cannot be established.
 
-The plugin does not read project sources, transcripts, prompts, worker output,
-Git metadata, or network services. It does not send telemetry. Runtime state
-is local and bounded; see [Architecture](docs/ARCHITECTURE.md) for retention
-details.
+The plugin does not read project sources, transcripts, task prose, worker
+output, Git metadata, or network services. Plaintext V1 dispatches expose only
+the fixed coordination header lines to its parser. Encrypted V2 dispatches use
+a strict non-secret `task_name` capability; the hook neither decrypts nor
+stores `message`. It does not send telemetry. Runtime state is local and
+bounded; see [Architecture](docs/ARCHITECTURE.md) for retention details.
 
 ## Supported environment
 

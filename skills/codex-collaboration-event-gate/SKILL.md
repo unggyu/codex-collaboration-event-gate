@@ -9,28 +9,46 @@ Use bounded native Codex workers from the root coordinator. Tell every worker
 not to spawn workers, give it explicit scope and completion criteria, and let
 independent tasks run concurrently.
 
-Every root `spawn_agent` message must declare `LEDGER_LANE`, shared
-`LEDGER_SLOT_CAPACITY`, and shared `LEDGER_CURRENT_ACTIVE`, as well as
-classification, parallelism class, exact exclusive gate(s), explicit model,
-and fork mode. Then call normal root `wait_agent`: its hook binds those
-same-session spawn capabilities into a fresh ledger and checks declared active
-count against observed dispatches. Do not use a script, session ID, or
-`PLUGIN_DATA` registrar. Missing, duplicate, phantom, or count-only active
-coverage fails closed. `git-ref:origin/qa` conflicts only with the same exact
-gate, not `git-ref:origin/develop`. After a verified wait, lifecycle events
-refresh surviving bound counts inside the hook; never try to refresh them.
+Every root `spawn_agent` call must declare its ledger lane, shared capacity,
+shared active count, classification, and parallelism class. Then call normal
+root `wait_agent`: its hook binds those same-session spawn capabilities into a
+fresh ledger and checks declared active count against observed dispatches. Do
+not use a script, session ID, or `PLUGIN_DATA` registrar. Missing, duplicate,
+phantom, or count-only active coverage fails closed. After a verified wait,
+lifecycle events refresh surviving bound counts inside the hook; never try to
+refresh them.
 
-For spawn metadata, declare `CLASSIFICATION` and `PARALLELISM_CLASS` in the
-worker message, and `EXCLUSIVE_GATE` for an exclusive lane. Non-UI workers use
-explicit `gpt-5.6-terra`; never use `fork_turns=all`. Use Sol only for explicit
-novel high-complexity UI or `SOL_OVERRIDE_REASON: user-requested` or
-`terra-blocked:<specific evidence>`.
+Codex Multi-Agent V2 encrypts `message` before `PreToolUse`, so put the fixed
+non-secret declaration in the visible `task_name` field using exactly:
 
-Put the fixed declarations as literal lines at the start of every worker
-message; describing them only in coordinator prose does not register them. If
-the spawn hook names a missing or invalid declaration, correct that exact
-input and retry the same dispatch once. This bounded correction is not a wait
-retry and does not authorize recovery.
+```text
+cceg1_<n|u>_<r|w>_<lane>_<capacity>_<active>_<d|h|u>
+```
+
+Use `n` for non-UI or `u` for UI; `r` for read-only or `w` for
+isolated-write; a unique 1-32 character lowercase alphanumeric lane; decimal
+capacity and active counts from 1-64; and `d` for default policy, `h` for novel
+high-complexity UI, or final `u` for an explicit user-requested Sol override.
+For example, a single non-UI read-only Terra worker uses
+`task_name: cceg1_n_r_isolatedsmoke_1_1_d`. Keep the actual task only in the
+encrypted `message`, use explicit `model: gpt-5.6-terra`, and use
+`fork_turns: none`.
+
+The encrypted V2 capability deliberately does not support `exclusive-gate` or
+`terra-blocked:<evidence>`: the hook cannot validate their exact plaintext
+values at this boundary and fails closed. Use a non-exclusive bounded worker,
+or a plaintext V1 surface when exact gate metadata is required.
+
+On a plaintext V1 spawn surface only, put `CLASSIFICATION`,
+`PARALLELISM_CLASS`, `LEDGER_LANE`, `LEDGER_SLOT_CAPACITY`, and
+`LEDGER_CURRENT_ACTIVE` as literal lines at the start of the worker message;
+add `EXCLUSIVE_GATE` for an exclusive lane. Non-UI workers use explicit
+`gpt-5.6-terra`; never use `fork_turns=all`. Use Sol only for explicit novel
+high-complexity UI or `SOL_OVERRIDE_REASON: user-requested` or
+`terra-blocked:<specific evidence>`. Do not combine plaintext headers with a
+`cceg1_` task capability. If the spawn hook names a missing or invalid
+declaration, correct that exact input and retry the same dispatch once. This
+bounded correction is not a wait retry and does not authorize recovery.
 
 After dispatch, call `wait_agent` exactly once. `PreToolUse` rewrites it to
 `3600000ms`; the native subscription consumes no model polling turns and

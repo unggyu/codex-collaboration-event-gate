@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -56,17 +57,24 @@ assert not any("TODO" in str(value) for value in manifest.values())
 
 config = json.loads(CONFIG.read_text(encoding="utf-8"))
 assert CONFIG == ROOT / "hooks" / "hooks.json"
+runtime_digest = hashlib.sha256(HOOK.read_bytes()).hexdigest()
+commands = []
 for groups in config["hooks"].values():
     for group in groups:
         for handler in group["hooks"]:
             command = handler["command"]
+            commands.append(command)
             assert "${PLUGIN_ROOT}" in command
+            assert runtime_digest in command
+            assert "_CODEX_EVENT_GATE_RUNTIME_BYTES" in command
             assert "git " not in command
             assert "$(git" not in command
+assert len(set(commands)) == 1
 assert config["hooks"]["Stop"][0]["hooks"][0]["timeout"] == 3
 
 source = HOOK.read_text(encoding="utf-8")
 assert "PLUGIN_DATA" in source
+assert "pin_runtime_snapshot" in source
 assert "git rev-parse" not in source
 assert "os.mkfifo" not in source
 assert "select.select" not in source
@@ -91,9 +99,9 @@ print("PASS: new sessions use the hook-owned callable registration protocol.")
 
 assert "V2_TASK_CAPABILITY" in source
 assert "FERNET_SHAPED_MESSAGE" in source
-assert "cceg1_<n|u>_<r|w>" in source
+assert "cceg2_<n|u>_<r|w>" in source
 for guidance in (README.read_text(encoding="utf-8"), SKILL.read_text(encoding="utf-8")):
-    assert "cceg1_<n|u>_<r|w>" in guidance
+    assert "cceg2_<n|u>_<r|w>" in guidance
     assert "encrypts" in guidance
 print("PASS: encrypted Multi-Agent V2 uses the visible fail-closed task-name capability.")
 
@@ -107,7 +115,7 @@ for contract in (
 assert "CODEX_THREAD_ID" not in source
 normalized_readme = " ".join(README.read_text(encoding="utf-8").split())
 assert "payload's `session_id`" in normalized_readme
-assert "malformed v12 state" in normalized_readme.lower()
+assert "malformed v13 state" in normalized_readme.lower()
 print("PASS: upgrade recovery is bound to hook payload identity and distinguishes legacy from current corruption.")
 
 readme = README.read_text(encoding="utf-8")
@@ -116,8 +124,9 @@ for guidance in (readme, skill):
     normalized = " ".join(guidance.split())
     assert "plain shell" in normalized
     assert "exit every Codex session" in normalized
-    assert "resolved cache path" in normalized
-print("PASS: update guidance preserves the active-session cache boundary.")
+    assert "runtime pin" in normalized
+    assert "not" in normalized and "hot-update" in normalized
+print("PASS: update guidance preserves the active-session boundary and treats runtime pinning only as a safety net.")
 
 with tempfile.TemporaryDirectory(prefix="codex-event-gate-vendor.") as name:
     temporary = Path(name)

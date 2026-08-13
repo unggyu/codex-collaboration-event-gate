@@ -18,10 +18,11 @@ the `Stop` hook is an enforcement check, not the waiter.
 | `PostToolUse(wait_agent)` | Re-arm one subscription after a correlated non-timeout return while work remains |
 | `SubagentStart` | Promote the oldest session-local pending dispatch to a worker; record unpaired starts safely |
 | `SubagentStop` | Remove a worker or reconcile a dropped `SubagentStart` pending dispatch |
-| `UserPromptSubmit` | Re-arm one wait when normal steering arrives, or apply an exact session-bound operator repair to a validated legacy barrier |
+| `UserPromptSubmit` | Re-arm one wait when normal steering arrives, or apply an exact session-bound operator repair to a validated recovery barrier |
 | `PreToolUse` | Deny child/repeated waits; allow one root wait and force `3600000ms` |
 | `Stop` | Return immediately; deny final while workers remain |
 | `SessionEnd` | Remove transient state for a closed parent session |
+| Runtime pin | Validate the loaded hook digest and persist its exact bytes under `PLUGIN_DATA/runtime` so loaded commands survive installed-cache removal |
 | Opaque audit | Retain bounded, hashed lifecycle outcomes under `PLUGIN_DATA/audit` |
 | Bundled skill | Teach the root reconciliation and no-polling workflow |
 
@@ -57,15 +58,18 @@ wall-clock timestamp ordering, makes concurrent dispatch ordering deterministic.
 | Confirmed interrupt result | Remove only the bound target; increment epoch | One wait if other work remains |
 | User steering | Increment epoch | One wait after reconciliation |
 | New dispatch | Add worker; increment epoch | One wait |
-| First normal root wait | Derive active count, validate capacity, lanes, exact gates, and one-to-one mappings from observed spawn metadata | One normal wait |
+| Inconsistent follow-up dispatch | Deny before mutation when it reuses a tracked lane, changes live shared capacity, exceeds available slots, or replaces/duplicates a visible batch position | Existing batch and wait authorization remain intact |
+| First normal root wait | Derive active count, validate capacity, lanes, exact gates, complete batch positions, and one-to-one mappings from observed spawn metadata | One normal wait |
 | First active-worker Stop | Increment epoch; mark continuation | One wait from immediate continuation |
 | Repeated active-worker Stop | No transition; `continue:false` | Explicit recovery, no loop |
 | Zero-worker Stop | Remove session/recovery state | Final may pass |
 | Strict v7 SessionStart | Preserve legacy work as unobserved metadata; clear stale wait/Stop capabilities; increment epoch | One ledger-bypass recovery wait, no conflicting dispatch/final |
 | Unsafe legacy SessionStart | Content-addressed quarantine plus valid current recovery barrier | One recovery wait or exact operator confirmation after native-empty diagnosis |
+| Existing active v13 startup/resume/clear | Preserve tracked work; clear stale ledger/wait/interrupt/Stop capabilities; create `resumed-current` barrier | Diagnose native registry first; root-only confirmation without waiting, otherwise one recovery wait |
+| Existing active v13 compact | Keep the ordinary current lifecycle unchanged | Continue event-driven live-worker reconciliation |
 | Missing-state SessionStart | Persist an owned mode-`0600` empty current state under the authoritative lock | Normal bounded dispatch |
 | Malformed current state | Preserve bytes in current-corruption quarantine; create a distinct valid barrier | Fail closed; one guarded wait or exact operator confirmation after native-empty diagnosis |
-| Session-bound operator confirmation | Verify exact current payload session hash and legacy barrier under lock; reset to empty current state | Normal bounded spawn and hook-owned ledger |
+| Session-bound operator confirmation | Verify exact current payload session hash and recovery barrier under lock; reset to empty current state | Normal bounded spawn and hook-owned ledger |
 
 Ledger state is invalidated by every epoch advance, including steering, worker
 completion/error, spawn failure, and confirmed interruption. The first normal
@@ -100,10 +104,13 @@ discovered globally nor deleted.
 | `SubagentStart`/`SubagentStop` | payload parent `session_id` | child `agent_id`, `agent_type`, `turn_id` |
 | resumed thread after client/WSL restart | new hook payload `session_id` | no environment-variable alias or global state discovery |
 
-Legacy recovery is entered only from `SessionStart`, under the authoritative
+Recovery barriers are entered only from `SessionStart`, under the authoritative
 session lock. Strict v7 worker and pending identities can be copied into the
-current schema with explicitly unobserved dispatch metadata. No normal ledger
-is built for that recovery barrier. Unsafe legacy bytes are hard-linked into a
+current schema with explicitly unobserved dispatch metadata. Existing active
+v13 work crossing `startup`, `resume`, or `clear` is preserved behind a
+`resumed-current` barrier after stale capabilities are invalidated; `compact`
+does not create that barrier. No normal ledger is built for a recovery barrier.
+Unsafe legacy bytes are hard-linked into a
 content-addressed quarantine before the old state name is unlinked, retaining
 at least one mode-`0600` copy across interruption and making duplicate recovery
 idempotent. A collision with different bytes fails closed and preserves both
@@ -114,10 +121,12 @@ sequence but use a distinct `quarantined-current` barrier. They are never
 migrated, interpreted as workers, or considered empty. Unsafe filesystem
 objects cannot enter either quarantine path.
 
-Legacy barriers use one recovery wait per event epoch. Wait returns, ordinary
+Recovery barriers use one recovery wait per event epoch. Wait returns, ordinary
 steering, and `Stop` do not manufacture another recovery epoch; an actual
-tracked completion may. When native `list_agents` is empty, the operator may
-submit the exact recovery command emitted by `SessionStart`. The command
+tracked completion may. Before any recovery wait, the coordinator runs one-shot
+`list_agents`. When it shows `/root` alone, the coordinator does not wait and
+the operator may submit the exact recovery command emitted by `SessionStart`.
+Only a listed real native child justifies the recovery wait. The command
 contains the current session hash but no selectable path/session parameter, so
 `UserPromptSubmit` can affect only its own payload identity.
 
@@ -138,17 +147,16 @@ must issue the next tool call.
 
 The only callable registration surface that a newly activated Codex session
 actually has is the root's normal `spawn_agent` call. Each root dispatch
-therefore declares the lane, shared capacity, active count, classification, and
-parallelism policy in a fixed non-secret surface. Plaintext V1 uses the legacy
-message headers. Multi-Agent V2 marks `message` encrypted before local
-`PreToolUse`, so it uses the visible strict task-name capability
-`cceg1_<n|u>_<r|w>_<lane>_<capacity>_<active>_<d|h|u>`. On the first normal
-`wait_agent`, the hook binds those declarations to its same-session
-pending/active dispatch capabilities, verifies the declared count against the
-observed count, and retains only hashes. After a verified ledger, lifecycle
-events refresh only the surviving bound count inside the hook for the next
-epoch. A caller cannot provide a session id, filesystem path, or registration
-capability.
+therefore declares the lane, shared capacity, final active count, batch ID,
+batch position, batch size, classification, and parallelism policy in a fixed
+non-secret surface. Plaintext V1 uses the legacy message headers. Multi-Agent
+V2 marks `message` encrypted before local `PreToolUse`, so it uses the visible
+strict task-name capability
+`cceg2_<n|u>_<r|w>_<lane>_<capacity>_<final_active>_<batch>_<position>_<size>_<d|h|u>`.
+On the first normal `wait_agent`, the hook binds those declarations to its
+same-session pending/active dispatch capabilities and verifies that every
+position in the visible intent was dispatched. A caller cannot provide a
+session id, filesystem path, or registration capability.
 
 Every tracked active/pending native dispatch must bind to exactly one active
 lane. The hook rejects missing coverage, multiple lane mappings for one
@@ -160,13 +168,21 @@ use exact, normalized strings. The taxonomy includes
 different ref strings such as QA and develop do not conflict.
 
 The hook rejects a root batch whose declared capacities disagree, whose active
-work exceeds its declared capacity, or whose exact active exclusive gates
-conflict. Deferral/dependency planning remains outside the hook protocol: only
-already-dispatched native work is authorization-relevant.
+work exceeds its declared capacity, whose visible batch intent has a missing or
+duplicate position, or whose exact active exclusive gates conflict. It cannot
+infer arbitrary task semantics: it proves only that all explicitly declared
+positions were dispatched before wait authorization.
+
+All back-to-back spawns in an initial batch declare the same final active
+count, equal to capacity, common batch ID, and every position from `1` through
+batch size. For example, a capacity-2 batch declares active/size `2` and
+positions `1` and `2`; it cannot wait after only one spawn. A later follow-up
+after a verified wait begins a distinct intent at position `1` and declares all
+currently free slots.
 
 For native spawn payloads, the hook can inspect visible `model`, `fork_turns`,
 and `task_name`. It parses plaintext fixed message headers only when they are
-actually visible. A Fernet-shaped V2 message without a valid `cceg1_`
+actually visible. A Fernet-shaped V2 message without a valid `cceg2_`
 capability fails closed; the hook never decrypts it or reads a transcript. The
 V2 grammar supports read-only and isolated-write dispatches and the two
 locally-verifiable Sol policies. Exact exclusive gates and
@@ -191,8 +207,18 @@ after the active map is empty. There is no passive post-final wake mechanism.
 
 ## Project independence
 
-The installed hook command resolves through `${PLUGIN_ROOT}`. The hook does
-not inspect the current directory, a Git repository, project files, transcript,
-or worktree topology. Runtime state resolves only through `${PLUGIN_DATA}`.
-The vendoring helper generates an absolute runner path for project hooks and
-provides equivalent variables without requiring Git.
+The installed hook command contains a small, digest-bound loader. On the first
+lifecycle event it validates the hook resolved through `${PLUGIN_ROOT}` and
+atomically pins those exact bytes as a private mode-`0600` file beneath
+`${PLUGIN_DATA}/runtime`. The already-loaded command prefers that pin on later
+events, so removal of a versioned installed cache does not strand a live
+session. A digest mismatch, symlink, unsafe owner, unsafe mode, or oversized
+runtime fails closed without falling through to a different installed version.
+Pins are content-addressed and intentionally are not deleted by `SessionEnd`,
+because other idle sessions may still hold the same loaded command.
+
+The hook does not inspect the current directory, a Git repository, project
+files, transcript, or worktree topology. Session and audit state resolve only
+through `${PLUGIN_DATA}`. The vendoring helper generates an absolute runner
+path for project hooks and provides equivalent variables without requiring
+Git.

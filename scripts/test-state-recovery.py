@@ -167,6 +167,9 @@ def spawn(root: Path, name: str, session: str, call: str) -> dict[str, object]:
             f"LEDGER_LANE: {call}",
             "LEDGER_SLOT_CAPACITY: 1",
             "LEDGER_CURRENT_ACTIVE: 1",
+            "LEDGER_BATCH_ID: batchone",
+            "LEDGER_BATCH_POSITION: 1",
+            "LEDGER_BATCH_SIZE: 1",
         )
     )
     return invoke(
@@ -183,6 +186,33 @@ def spawn(root: Path, name: str, session: str, call: str) -> dict[str, object]:
             },
             tool_name="Agent",
             tool_use_id=call,
+        ),
+    )
+
+
+def promote_spawn(
+    root: Path, name: str, session: str, call: str, agent: str
+) -> None:
+    invoke(
+        root,
+        name,
+        event(
+            "PostToolUse",
+            session,
+            tool_input={"task_name": call},
+            tool_name="Agent",
+            tool_response={"task_name": f"/root/{call}"},
+            tool_use_id=call,
+        ),
+    )
+    invoke(
+        root,
+        name,
+        event(
+            "SubagentStart",
+            session,
+            agent_id=agent,
+            agent_type="worker",
         ),
     )
 
@@ -205,7 +235,7 @@ with tempfile.TemporaryDirectory(prefix="codex-event-gate-recovery.") as tempora
     assert fresh_path.exists()
     assert stat.S_IMODE(fresh_path.stat().st_mode) == 0o600
     fresh = json.loads(fresh_path.read_text())
-    assert fresh["version"] == 12
+    assert fresh["version"] == 13
     assert fresh["session_hash"] == digest(session)
     assert fresh["workers"] == {} and fresh["pending"] == {}
     assert fresh["ledger"] is None and fresh["ledger_verified"] is False
@@ -237,7 +267,103 @@ with tempfile.TemporaryDirectory(prefix="codex-event-gate-recovery.") as tempora
     corrected = json.loads(fresh_path.read_text())
     assert len(corrected["pending"]) == 1
     assert corrected["last_event"] == "dispatch-pending"
-    print("PASS: fresh SessionStart persists empty v12 state and invalid spawn metadata is explicitly correctable.")
+    print("PASS: fresh SessionStart persists empty v13 state and invalid spawn metadata is explicitly correctable.")
+
+    # Exact stranded-current incident: a structurally valid v13 ledger retains
+    # one worker after its native completion event was lost. A resume boundary
+    # must not treat that file as proof of a live native child or recommend a
+    # blind wait. Native-root-only confirmation repairs it without waiting.
+    name = "stale-current-resume"
+    session = "stale-current-resume-session"
+    start(root, name, session, "startup")
+    assert spawn(root, name, session, "stale-current-worker") == {}
+    promote_spawn(
+        root,
+        name,
+        session,
+        "stale-current-worker",
+        "stale-native-agent",
+    )
+    assert permission(wait(root, name, session, "pre-resume-wait")) == "allow"
+    before_resume = json.loads(state_path(root, name, session).read_text())
+    assert before_resume["ledger_verified"] is True
+    assert set(before_resume["workers"]) == {"stale-native-agent"}
+
+    resumed_current = start(root, name, session, "resume")
+    current_context = resumed_current["hookSpecificOutput"]["additionalContext"]  # type: ignore[index]
+    assert "valid current v13 state crossed" in current_context
+    assert "Before calling wait_agent, run one-shot list_agents" in current_context
+    assert "no native children, do not wait" in current_context
+    assert repair_command(session) in current_context
+    current_barrier = json.loads(state_path(root, name, session).read_text())
+    assert current_barrier["legacy_recovery"] == {
+        "kind": "resumed-current",
+        "pending_count": 0,
+        "quarantine_hash": "",
+        "source_version": 13,
+        "worker_count": 1,
+    }
+    assert set(current_barrier["workers"]) == {"stale-native-agent"}
+    assert current_barrier["ledger"] is None
+    assert current_barrier["ledger_verified"] is False
+    assert current_barrier["wait_call_hash"] == ""
+    assert current_barrier["wait_issued_epoch"] < current_barrier["event_epoch"]
+
+    repaired_current = invoke(
+        root,
+        name,
+        event("UserPromptSubmit", session, prompt=repair_command(session)),
+    )
+    assert "valid empty current state" in repaired_current["hookSpecificOutput"]["additionalContext"]  # type: ignore[index]
+    native_empty = json.loads(state_path(root, name, session).read_text())
+    assert native_empty["workers"] == {} and native_empty["pending"] == {}
+    assert native_empty["legacy_recovery"] is None
+    assert spawn(root, name, session, "after-current-repair") == {}
+    print("PASS: resumed current active state requires native-first reconciliation and root-only repair needs no wait.")
+
+    for boundary_source in ("startup", "clear"):
+        name = f"stale-current-{boundary_source}"
+        session = f"stale-current-{boundary_source}-session"
+        start(root, name, session, "startup")
+        invoke(
+            root,
+            name,
+            event(
+                "SubagentStart",
+                session,
+                agent_id=f"{boundary_source}-native-agent",
+                agent_type="worker",
+            ),
+        )
+        boundary = start(root, name, session, boundary_source)
+        boundary_context = boundary["hookSpecificOutput"]["additionalContext"]  # type: ignore[index]
+        assert "Before calling wait_agent" in boundary_context
+        boundary_state = json.loads(state_path(root, name, session).read_text())
+        assert boundary_state["legacy_recovery"]["kind"] == "resumed-current"
+        assert boundary_state["last_event"] == f"{boundary_source}-current-recovery"
+    print("PASS: startup and clear boundaries also quarantine uncertain current work for native-first reconciliation.")
+
+    # Compacting a live turn does not imply a native lifecycle discontinuity.
+    # Its current workers remain on the ordinary event-driven path.
+    name = "live-current-compact"
+    session = "live-current-compact-session"
+    start(root, name, session, "startup")
+    invoke(
+        root,
+        name,
+        event(
+            "SubagentStart",
+            session,
+            agent_id="live-native-agent",
+            agent_type="worker",
+        ),
+    )
+    compacted = start(root, name, session, "compact")
+    assert "event gate is active" in compacted["hookSpecificOutput"]["additionalContext"]  # type: ignore[index]
+    compact_state = json.loads(state_path(root, name, session).read_text())
+    assert compact_state["legacy_recovery"] is None
+    assert set(compact_state["workers"]) == {"live-native-agent"}
+    print("PASS: compact preserves the ordinary live-worker lifecycle without a resume barrier.")
 
     # Exact incident: v7 active workers plus an already-consumed v2 recovery
     # token resume under the authoritative payload session_id.
@@ -248,7 +374,7 @@ with tempfile.TemporaryDirectory(prefix="codex-event-gate-recovery.") as tempora
     context = resumed["hookSpecificOutput"]["additionalContext"]  # type: ignore[index]
     assert "legacy v7 lifecycle state was migrated" in context
     migrated = json.loads(state_path(root, name, session).read_text())
-    assert migrated["version"] == 12
+    assert migrated["version"] == 13
     assert migrated["event_epoch"] == 1012
     assert set(migrated["workers"]) == {
         f"legacy-agent-{index}" for index in range(6)
@@ -292,7 +418,7 @@ with tempfile.TemporaryDirectory(prefix="codex-event-gate-recovery.") as tempora
     empty_started = start(root, name, session)
     assert "event gate is active" in empty_started["hookSpecificOutput"]["additionalContext"]  # type: ignore[index]
     empty_current = json.loads(state_path(root, name, session).read_text())
-    assert empty_current["version"] == 12
+    assert empty_current["version"] == 13
     assert empty_current["legacy_recovery"] is None
     assert empty_current["workers"] == {} and empty_current["pending"] == {}
     assert spawn(root, name, session, "post-empty-migration") == {}
@@ -307,7 +433,7 @@ with tempfile.TemporaryDirectory(prefix="codex-event-gate-recovery.") as tempora
     context = quarantined["hookSpecificOutput"]["additionalContext"]  # type: ignore[index]
     assert "could not be migrated safely" in context
     current = json.loads(state_path(root, name, session).read_text())
-    assert current["version"] == 12
+    assert current["version"] == 13
     assert current["legacy_recovery"]["kind"] == "quarantined-legacy"
     quarantine_files = list((root / name / "quarantine").glob("*.json"))
     assert len(quarantine_files) == 1

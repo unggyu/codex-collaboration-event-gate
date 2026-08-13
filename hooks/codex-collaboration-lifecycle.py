@@ -29,11 +29,12 @@ from typing import Any, Iterator
 import re
 
 
-STATE_VERSION = 12
+STATE_VERSION = 13
 LEGACY_STATE_VERSIONS = frozenset(range(1, STATE_VERSION))
 RECOVERY_VERSION = 2
 MAX_RECOVERY_WAIT_TIMEOUT_MS = 3_600_000
 SESSION_SOURCES = frozenset({"startup", "resume", "clear", "compact"})
+NATIVE_RECONCILIATION_SOURCES = frozenset({"startup", "resume", "clear"})
 WAIT_AGENT_HOOK_NAMES = frozenset(
     {"wait_agent", "collaborationwait_agent", "multi_agent_v1wait_agent"}
 )
@@ -78,6 +79,7 @@ MAX_LEDGER_GATES = 8
 MAX_LEDGER_DEPENDENCIES = 16
 MAX_SLOT_CAPACITY = 64
 MAX_RUNTIME_FILE_BYTES = 2 * 1024 * 1024
+RUNTIME_DIRECTORY_NAME = "runtime"
 MAX_AUDIT_RECORDS = 128
 MAX_AUDIT_FILES = 256
 AUDIT_RETENTION_SECONDS = 14 * 24 * 60 * 60
@@ -101,10 +103,12 @@ GATE_PATTERNS = (
 PROMPT_METADATA = re.compile(
     r"(?m)^\s*(CLASSIFICATION|PARALLELISM_CLASS|EXCLUSIVE_GATE|"
     r"SOL_OVERRIDE_REASON|NOVEL_UI_COMPLEXITY|LEDGER_LANE|"
-    r"LEDGER_SLOT_CAPACITY|LEDGER_CURRENT_ACTIVE)\s*:\s*([^\r\n]{1,512})\s*$"
+    r"LEDGER_SLOT_CAPACITY|LEDGER_CURRENT_ACTIVE|LEDGER_BATCH_ID|"
+    r"LEDGER_BATCH_POSITION|LEDGER_BATCH_SIZE)\s*:\s*([^\r\n]{1,512})\s*$"
 )
 V2_TASK_CAPABILITY = re.compile(
-    r"^cceg1_(n|u)_(r|w)_([a-z0-9]{1,32})_"
+    r"^cceg2_(n|u)_(r|w)_([a-z0-9]{1,32})_"
+    r"([1-9][0-9]?)_([1-9][0-9]?)_([a-z0-9]{1,32})_"
     r"([1-9][0-9]?)_([1-9][0-9]?)_(d|h|u)$"
 )
 FERNET_SHAPED_MESSAGE = re.compile(r"^gAAAA[A-Za-z0-9_-]{32,32763}={0,2}$")
@@ -155,6 +159,16 @@ def private_directory(path: Path) -> Path:
     return path
 
 
+def plugin_data_root() -> Path:
+    plugin_data = os.environ.get("PLUGIN_DATA", "")
+    if not plugin_data:
+        raise StateCorruption("PLUGIN_DATA is unavailable")
+    base = Path(plugin_data).expanduser()
+    if not base.is_absolute():
+        raise StateCorruption("PLUGIN_DATA must be an absolute path")
+    return private_directory(base)
+
+
 def opaque_id(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8", "surrogateescape")).hexdigest()
 
@@ -188,6 +202,9 @@ def valid_dispatch_metadata(value: Any) -> bool:
     return (
         isinstance(value, dict)
         and set(value) == {
+            "batch_hash",
+            "batch_position",
+            "batch_size",
             "classification",
             "fork_mode",
             "gate_hashes",
@@ -207,6 +224,11 @@ def valid_dispatch_metadata(value: Any) -> bool:
         and value["fork_mode"] in {"", *FORK_MODES}
         and value["parallelism_class"] in {"", *PARALLELISM_CLASSES}
         and (not value["lane_hash"] or valid_digest(value["lane_hash"]))
+        and (not value["batch_hash"] or valid_digest(value["batch_hash"]))
+        and type(value["batch_position"]) is int
+        and 0 <= value["batch_position"] <= MAX_SLOT_CAPACITY
+        and type(value["batch_size"]) is int
+        and 0 <= value["batch_size"] <= MAX_SLOT_CAPACITY
         and type(value["ledger_capacity"]) is int
         and 0 <= value["ledger_capacity"] <= MAX_SLOT_CAPACITY
         and type(value["ledger_active_count"]) is int
@@ -225,18 +247,39 @@ def valid_dispatch_metadata(value: Any) -> bool:
             not value["observed"]
             or (
                 valid_digest(value["lane_hash"])
+                and valid_digest(value["batch_hash"])
+                and 1 <= value["batch_position"] <= value["batch_size"]
                 and 1 <= value["ledger_capacity"] <= MAX_SLOT_CAPACITY
-                and 1 <= value["ledger_active_count"] <= value["ledger_capacity"]
+                and value["ledger_active_count"] == value["ledger_capacity"]
+                and value["batch_size"] <= value["ledger_capacity"]
             )
         )
         and (
             value["observed"]
             or (
                 value["lane_hash"] == ""
+                and value["batch_hash"] == ""
+                and value["batch_position"] == 0
+                and value["batch_size"] == 0
                 and value["ledger_active_count"] == 0
                 and value["ledger_capacity"] == 0
             )
         )
+    )
+
+
+def valid_batch_intent(value: Any) -> bool:
+    return value is None or (
+        isinstance(value, dict)
+        and set(value) == {"batch_hash", "capacity", "positions", "size"}
+        and valid_digest(value["batch_hash"])
+        and type(value["capacity"]) is int
+        and 1 <= value["capacity"] <= MAX_SLOT_CAPACITY
+        and type(value["size"]) is int
+        and 1 <= value["size"] <= value["capacity"]
+        and isinstance(value["positions"], list)
+        and value["positions"] == sorted(set(value["positions"]))
+        and all(type(position) is int and 1 <= position <= value["size"] for position in value["positions"])
     )
 
 
@@ -252,7 +295,12 @@ def valid_legacy_recovery(value: Any) -> bool:
             "worker_count",
         }
         and value["kind"]
-        in {"migrated", "quarantined-current", "quarantined-legacy"}
+        in {
+            "migrated",
+            "quarantined-current",
+            "quarantined-legacy",
+            "resumed-current",
+        }
         and type(value["source_version"]) is int
         and -1 <= value["source_version"] <= 1_000_000
         and type(value["worker_count"]) is int
@@ -339,16 +387,11 @@ def state_paths(payload: dict[str, Any]) -> tuple[Path, Path, Path, Path]:
     session_id = text_field(payload, "session_id")
     if not session_id:
         raise StateCorruption("missing session identity")
-    plugin_data = os.environ.get("PLUGIN_DATA", "")
-    if not plugin_data:
-        raise StateCorruption("PLUGIN_DATA is unavailable")
-    base = Path(plugin_data).expanduser()
-    if not base.is_absolute():
-        raise StateCorruption("PLUGIN_DATA must be an absolute path")
-    sessions = private_directory(private_directory(base) / "sessions")
+    base = plugin_data_root()
+    sessions = private_directory(base / "sessions")
     session_key = opaque_id(session_id)
     prefix = sessions / session_key
-    audit = private_directory(private_directory(base) / "audit")
+    audit = private_directory(base / "audit")
     return (
         prefix.with_suffix(".json"),
         prefix.with_suffix(".lock"),
@@ -359,6 +402,7 @@ def state_paths(payload: dict[str, Any]) -> tuple[Path, Path, Path, Path]:
 
 def new_state(session_id: str) -> dict[str, Any]:
     return {
+        "batch_intent": None,
         "dispatch_sequence": 0,
         "event_epoch": 0,
         "interrupts": {},
@@ -386,7 +430,9 @@ def new_recovery_control(session_id: str) -> dict[str, Any]:
     }
 
 
-def regular_file_bytes(path: Path, purpose: str) -> bytes:
+def bounded_owned_file_bytes(
+    path: Path, purpose: str, *, exact_mode: int | None
+) -> bytes:
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -401,8 +447,12 @@ def regular_file_bytes(path: Path, purpose: str) -> bytes:
             raise StateCorruption(f"{purpose} is not a regular file")
         if info.st_uid != os.geteuid():
             raise StateCorruption(f"{purpose} has the wrong owner")
-        if stat.S_IMODE(info.st_mode) != 0o600:
-            raise StateCorruption(f"{purpose} permissions are unsafe")
+        mode = stat.S_IMODE(info.st_mode)
+        if exact_mode is not None:
+            if mode != exact_mode:
+                raise StateCorruption(f"{purpose} permissions are unsafe")
+        elif mode & 0o022:
+            raise StateCorruption(f"{purpose} is writable by another user")
         if info.st_size > MAX_RUNTIME_FILE_BYTES:
             raise StateCorruption(f"{purpose} exceeds the bounded size")
         with os.fdopen(descriptor, "rb", closefd=False) as handle:
@@ -411,6 +461,67 @@ def regular_file_bytes(path: Path, purpose: str) -> bytes:
         raise StateCorruption(f"{purpose} is unreadable") from error
     finally:
         os.close(descriptor)
+
+
+def regular_file_bytes(path: Path, purpose: str) -> bytes:
+    return bounded_owned_file_bytes(path, purpose, exact_mode=0o600)
+
+
+def write_private_bytes(path: Path, raw: bytes) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory = os.open(
+            path.parent,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def pin_runtime_snapshot() -> Path:
+    """Persist the exact loaded hook so a live session survives cache GC."""
+    loaded = globals().get("_CODEX_EVENT_GATE_RUNTIME_BYTES")
+    if loaded is None:
+        source_path = Path(os.path.abspath(__file__))
+        raw = bounded_owned_file_bytes(
+            source_path, "hook runtime source", exact_mode=None
+        )
+    elif isinstance(loaded, bytes) and len(loaded) <= MAX_RUNTIME_FILE_BYTES:
+        raw = loaded
+    else:
+        raise StateCorruption("loaded hook runtime bytes are invalid")
+
+    digest = hashlib.sha256(raw).hexdigest()
+    runtime = private_directory(plugin_data_root() / RUNTIME_DIRECTORY_NAME)
+    target = runtime / f"{digest}.py"
+    try:
+        pinned = regular_file_bytes(target, "pinned hook runtime")
+    except FileNotFoundError:
+        write_private_bytes(target, raw)
+        pinned = regular_file_bytes(target, "pinned hook runtime")
+    if pinned != raw or hashlib.sha256(pinned).hexdigest() != digest:
+        raise StateCorruption("pinned hook runtime does not match loaded code")
+    globals().pop("_CODEX_EVENT_GATE_RUNTIME_BYTES", None)
+    return target
 
 
 def decoded_json_object(raw: bytes, purpose: str) -> dict[str, Any]:
@@ -445,7 +556,9 @@ def load_state(path: Path, session_id: str) -> tuple[dict[str, Any], bool]:
         or not isinstance(value.get("workers"), dict)
         or not isinstance(value.get("pending"), dict)
         or not isinstance(value.get("interrupts"), dict)
+        or len(value["workers"]) + len(value["pending"]) > MAX_LEDGER_LANES
         or not valid_legacy_recovery(value.get("legacy_recovery"))
+        or not valid_batch_intent(value.get("batch_intent"))
         or not valid_ledger(value.get("ledger"))
         or not isinstance(value.get("ledger_verified"), bool)
         or len(value["interrupts"]) > MAX_INTERRUPT_CAPABILITIES
@@ -689,16 +802,18 @@ def session_lock(path: Path) -> Iterator[None]:
 
 
 def synchronize_declared_active_count(state: dict[str, Any]) -> None:
-    """Refresh bound batch counts only after a verified ledger epoch."""
+    """Check live occupancy without rewriting the immutable batch declaration."""
     active_count = len(state["workers"]) + len(state["pending"])
-    for pending in state["pending"].values():
-        metadata = pending["dispatch_metadata"]
-        if metadata["observed"]:
-            metadata["ledger_active_count"] = active_count
-    for worker in state["workers"].values():
-        metadata = worker["dispatch_metadata"]
-        if metadata["observed"]:
-            metadata["ledger_active_count"] = active_count
+    observed = [
+        item["dispatch_metadata"]
+        for collection in (state["pending"], state["workers"])
+        for item in collection.values()
+        if item["dispatch_metadata"]["observed"]
+    ]
+    if any(active_count > metadata["ledger_capacity"] for metadata in observed):
+        raise StateCorruption(
+            "tracked dispatches exceed a bound dispatch's declared capacity"
+        )
 
 
 def advance_event(state: dict[str, Any], event: str) -> None:
@@ -884,9 +999,14 @@ def interrupt_response_confirms_terminal(response: Any) -> bool:
     ):
         return True
     previous_status = value.get("previous_status")
+    if isinstance(previous_status, str):
+        return previous_status.lower() in INTERRUPT_SUCCESS_PREVIOUS_STATUSES
+    if not isinstance(previous_status, dict) or len(previous_status) != 1:
+        return False
+    tagged_status = next(iter(previous_status))
     return (
-        isinstance(previous_status, str)
-        and previous_status.lower() in INTERRUPT_SUCCESS_PREVIOUS_STATUSES
+        isinstance(tagged_status, str)
+        and tagged_status.lower() in INTERRUPT_SUCCESS_PREVIOUS_STATUSES
     )
 
 
@@ -980,15 +1100,15 @@ def v2_task_metadata(tool_input: Any) -> dict[str, str] | None:
     if not isinstance(tool_input, dict):
         return None
     task_name = tool_input.get("task_name")
-    if not isinstance(task_name, str) or not task_name.startswith("cceg1_"):
+    if not isinstance(task_name, str) or not task_name.startswith("cceg2_"):
         return None
     matched = V2_TASK_CAPABILITY.fullmatch(task_name)
     if matched is None:
         raise StateCorruption(
             "V2 task_name capability must match "
-            "cceg1_<n|u>_<r|w>_<lane>_<capacity>_<active>_<d|h|u>"
+            "cceg2_<n|u>_<r|w>_<lane>_<capacity>_<active>_<batch>_<position>_<size>_<d|h|u>"
         )
-    classification, parallelism, lane, capacity, active, sol_policy = (
+    classification, parallelism, lane, capacity, active, batch, position, size, sol_policy = (
         matched.groups()
     )
     values = {
@@ -1000,6 +1120,9 @@ def v2_task_metadata(tool_input: Any) -> dict[str, str] | None:
         "LEDGER_LANE": lane,
         "LEDGER_SLOT_CAPACITY": capacity,
         "LEDGER_CURRENT_ACTIVE": active,
+        "LEDGER_BATCH_ID": batch,
+        "LEDGER_BATCH_POSITION": position,
+        "LEDGER_BATCH_SIZE": size,
     }
     if sol_policy == "h":
         values["NOVEL_UI_COMPLEXITY"] = "high"
@@ -1062,7 +1185,7 @@ def spawn_metadata(tool_input: Any) -> dict[str, Any]:
     else:
         if has_opaque_v2_message(tool_input):
             raise StateCorruption(
-                "encrypted V2 message requires a visible cceg1 task_name capability"
+                "encrypted V2 message requires a visible cceg2 task_name capability"
             )
         values = prompt_values
     classification = values.get("CLASSIFICATION", "").lower()
@@ -1110,7 +1233,29 @@ def spawn_metadata(tool_input: Any) -> dict[str, Any]:
         1,
         capacity,
     )
+    if active_count != capacity:
+        raise StateCorruption(
+            "LEDGER_CURRENT_ACTIVE must equal LEDGER_SLOT_CAPACITY for a complete batch intent"
+        )
+    batch_id = values.get("LEDGER_BATCH_ID", "").strip()
+    if not re.fullmatch(r"[a-z0-9]{1,32}", batch_id):
+        raise StateCorruption("LEDGER_BATCH_ID must be 1-32 lowercase alphanumeric characters")
+    batch_size = ledger_integer(
+        values.get("LEDGER_BATCH_SIZE", ""),
+        "LEDGER_BATCH_SIZE",
+        1,
+        capacity,
+    )
+    batch_position = ledger_integer(
+        values.get("LEDGER_BATCH_POSITION", ""),
+        "LEDGER_BATCH_POSITION",
+        1,
+        batch_size,
+    )
     return {
+        "batch_hash": opaque_id(batch_id),
+        "batch_position": batch_position,
+        "batch_size": batch_size,
         "classification": classification,
         "fork_mode": fork_mode,
         "gate_hashes": gate_hashes,
@@ -1154,6 +1299,9 @@ def policy_error(metadata: dict[str, Any]) -> str:
 
 def empty_dispatch_metadata() -> dict[str, Any]:
     return {
+        "batch_hash": "",
+        "batch_position": 0,
+        "batch_size": 0,
         "classification": "",
         "fork_mode": "",
         "gate_hashes": [],
@@ -1168,6 +1316,125 @@ def empty_dispatch_metadata() -> dict[str, Any]:
         "sol_override_evidence_hash": "",
         "sol_override_kind": "",
     }
+
+
+def spawn_batch_contract_error(
+    state: dict[str, Any], metadata: dict[str, Any]
+) -> str:
+    """Reject a follow-up dispatch before it can corrupt bound batch state."""
+    tracked = [
+        item["dispatch_metadata"]
+        for collection in (state["pending"], state["workers"])
+        for item in collection.values()
+    ]
+    intent = state["batch_intent"]
+    if not tracked:
+        if intent is not None:
+            if metadata["batch_hash"] != intent["batch_hash"]:
+                return "a new batch intent cannot replace an incomplete declared batch"
+            if metadata["batch_size"] != intent["size"]:
+                return "root dispatches disagree on LEDGER_BATCH_SIZE"
+            if metadata["ledger_capacity"] != intent["capacity"]:
+                return "root dispatches disagree on batch capacity"
+            if metadata["batch_position"] in intent["positions"]:
+                return "LEDGER_BATCH_POSITION is already declared by this batch"
+            return ""
+        if metadata["batch_position"] != 1:
+            return "a new batch intent must begin at LEDGER_BATCH_POSITION 1"
+        if metadata["batch_size"] != metadata["ledger_capacity"]:
+            return (
+                "the initial batch intent must declare every available slot: "
+                "LEDGER_BATCH_SIZE must equal LEDGER_SLOT_CAPACITY"
+            )
+        return ""
+    if any(not candidate["observed"] for candidate in tracked):
+        return (
+            "tracked work includes an unpaired lifecycle record that cannot be "
+            "mixed with a declared root dispatch"
+        )
+    if any(
+        candidate["lane_hash"] == metadata["lane_hash"]
+        for candidate in tracked
+    ):
+        return "LEDGER_LANE is already used by a tracked root dispatch"
+    capacities = {candidate["ledger_capacity"] for candidate in tracked}
+    if len(capacities) != 1:
+        return "tracked root dispatches already disagree on shared capacity"
+    shared_capacity = capacities.pop()
+    if metadata["ledger_capacity"] != shared_capacity:
+        return (
+            f"LEDGER_SLOT_CAPACITY {metadata['ledger_capacity']} conflicts with "
+            f"the tracked batch capacity {shared_capacity}"
+        )
+    prospective_active = len(tracked) + 1
+    if prospective_active > shared_capacity:
+        return (
+            f"the follow-up dispatch would require {prospective_active} active "
+            f"slots but the tracked batch capacity is {shared_capacity}"
+        )
+    if intent is None:
+        if not state["ledger_verified"]:
+            return "the initial batch intent is missing before its first verified wait"
+        available_slots = shared_capacity - len(tracked)
+        if metadata["batch_position"] != 1:
+            return "a follow-up batch intent must begin at LEDGER_BATCH_POSITION 1"
+        if metadata["batch_size"] != available_slots:
+            return (
+                f"the follow-up batch intent must declare all {available_slots} "
+                "currently available slots"
+            )
+    else:
+        if metadata["batch_hash"] != intent["batch_hash"]:
+            return "a new batch intent cannot replace an incomplete declared batch"
+        if metadata["batch_size"] != intent["size"]:
+            return "root dispatches disagree on LEDGER_BATCH_SIZE"
+        if metadata["ledger_capacity"] != intent["capacity"]:
+            return "root dispatches disagree on batch capacity"
+        if metadata["batch_position"] in intent["positions"]:
+            return "LEDGER_BATCH_POSITION is already declared by this batch"
+    return ""
+
+
+def record_batch_position(state: dict[str, Any], metadata: dict[str, Any]) -> None:
+    """Bind one visible batch position to this session before native spawn."""
+    intent = state["batch_intent"]
+    if intent is None:
+        state["batch_intent"] = {
+            "batch_hash": metadata["batch_hash"],
+            "capacity": metadata["ledger_capacity"],
+            "positions": [metadata["batch_position"]],
+            "size": metadata["batch_size"],
+        }
+        return
+    intent["positions"].append(metadata["batch_position"])
+    intent["positions"].sort()
+
+
+def clear_failed_batch_position(state: dict[str, Any], metadata: dict[str, Any]) -> None:
+    """Permit a corrected retry only for an explicit failed native spawn."""
+    intent = state["batch_intent"]
+    if intent is None or metadata["batch_hash"] != intent["batch_hash"]:
+        return
+    try:
+        intent["positions"].remove(metadata["batch_position"])
+    except ValueError:
+        return
+    if not intent["positions"]:
+        state["batch_intent"] = None
+
+
+def batch_intent_error(state: dict[str, Any]) -> str:
+    """Require that every coordinator-declared position was dispatched."""
+    intent = state["batch_intent"]
+    if intent is None:
+        return "no open batch intent is available for this wait"
+    expected = list(range(1, intent["size"] + 1))
+    if intent["positions"] != expected:
+        return (
+            "the visible batch intent is incomplete; dispatch every declared "
+            "LEDGER_BATCH_POSITION before wait_agent"
+        )
+    return ""
 
 
 def record_spawn_dispatch(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1212,12 +1479,29 @@ def record_spawn_dispatch(payload: dict[str, Any]) -> dict[str, Any]:
             )
             return wait_denial(
                 "spawn_agent is blocked because this authoritative lifecycle "
-                "session is under explicit legacy-state recovery. Do not retry; "
-                "reconcile surviving workers with the one guarded wait or use "
-                "the SessionStart operator command only after list_agents "
-                "confirms that no native children remain."
+                "session is under explicit recovery. Do not retry. Run one-shot "
+                "list_agents first; use the SessionStart operator command if "
+                "only /root remains, or consume the one guarded wait only when "
+                "real native children are listed."
             )
         if call_key not in state["pending"]:
+            batch_error = spawn_batch_contract_error(state, metadata)
+            if batch_error:
+                audit_record(
+                    audit_path,
+                    payload,
+                    "PreToolUse",
+                    "spawn-denied-batch-contract",
+                    epoch=state["event_epoch"],
+                    tool_use_id=text_field(payload, "tool_use_id", 256),
+                )
+                return wait_denial(
+                    f"spawn_agent batch declaration is invalid: {batch_error}. "
+                    "Existing lifecycle state was left unchanged. Correct the "
+                    "declaration once if the tracked batch has room; otherwise "
+                    "finish or interrupt tracked work before starting a fresh "
+                    "batch."
+                )
             now = time.time()
             state["dispatch_sequence"] += 1
             state["pending"][call_key] = {
@@ -1229,6 +1513,7 @@ def record_spawn_dispatch(payload: dict[str, Any]) -> dict[str, Any]:
                 "turn_hash": opaque_id(text_field(payload, "turn_id")),
                 "updated_at": now,
             }
+            record_batch_position(state, metadata)
             advance_event(state, "dispatch-pending")
             write_state(state_path, state)
             audit_record(
@@ -1273,7 +1558,9 @@ def reconcile_spawn_dispatch(payload: dict[str, Any]) -> dict[str, Any]:
             )
             return {}
         if spawn_failure(payload.get("tool_response")):
-            state["pending"].pop(call_key, None)
+            pending = state["pending"].pop(call_key, None)
+            if pending is not None:
+                clear_failed_batch_position(state, pending["dispatch_metadata"])
             advance_event(state, "dispatch-failed")
             write_state(state_path, state)
             audit_record(
@@ -1622,8 +1909,8 @@ def hook_owned_ledger(state: dict[str, Any]) -> dict[str, Any]:
             raise StateCorruption("root dispatches disagree on ledger capacity or active count")
         capacity = capacities.pop()
         declared_active = declared_counts.pop()
-        if declared_active != len(candidates):
-            raise StateCorruption("declared active count does not match tracked dispatches")
+        if declared_active != capacity:
+            raise StateCorruption("declared active count does not match batch capacity")
     else:
         # Lifecycle-only events have no native parent dispatch payload. Keep
         # them mapped exactly once for recovery compatibility, but do not
@@ -1712,7 +1999,7 @@ def valid_legacy_timestamp(value: Any) -> bool:
 
 
 def migrate_v7_state(value: dict[str, Any], session_id: str) -> dict[str, Any]:
-    """Preserve v7 lifecycle identities without fabricating v12 ledger data."""
+    """Preserve v7 lifecycle identities without fabricating v13 ledger data."""
     expected = {
         "dispatch_sequence",
         "event_epoch",
@@ -1948,6 +2235,30 @@ def operator_recovery_command(session_id: str) -> str:
     )
 
 
+def arm_current_resume_barrier(
+    state: dict[str, Any], source: str
+) -> None:
+    """Require native reconciliation when current work crosses a boundary."""
+    assert source in NATIVE_RECONCILIATION_SOURCES
+    assert has_active_work(state) and not has_recovery_barrier(state)
+    previous_epoch = state["event_epoch"]
+    state["event_epoch"] += 1
+    state["interrupts"] = {}
+    state["last_event"] = f"{source}-current-recovery"
+    state["ledger"] = None
+    state["ledger_verified"] = False
+    state["stop_continuation_epoch"] = -1
+    state["wait_call_hash"] = ""
+    state["wait_issued_epoch"] = previous_epoch
+    state["legacy_recovery"] = {
+        "kind": "resumed-current",
+        "pending_count": len(state["pending"]),
+        "quarantine_hash": "",
+        "source_version": STATE_VERSION,
+        "worker_count": len(state["workers"]),
+    }
+
+
 def legacy_recovery_context(state: dict[str, Any], session_id: str) -> str:
     recovery = state["legacy_recovery"]
     assert recovery is not None
@@ -1955,30 +2266,39 @@ def legacy_recovery_context(state: dict[str, Any], session_id: str) -> str:
         detail = (
             "A legacy v7 lifecycle state was migrated without inventing ledger "
             "metadata. Tracked worker and pending identities were preserved. "
-            "Exactly one ledger-bypass recovery wait_agent is available for "
-            "the current recovery epoch; conflicting dispatch and final remain "
-            "blocked while legacy work is tracked."
+            "Conflicting dispatch and final remain blocked while legacy work "
+            "is tracked."
         )
     elif recovery["kind"] == "quarantined-legacy":
         detail = (
             "A legacy v7 lifecycle state could not be migrated safely and was "
             "moved to a mode-600 content-addressed quarantine. Its current "
-            "session remains behind a recovery barrier; exactly one guarded "
-            "recovery wait_agent is available, and dispatch/final remain blocked."
+            "session remains behind a recovery barrier, and dispatch/final "
+            "remain blocked."
         )
-    else:
+    elif recovery["kind"] == "quarantined-current":
         detail = (
             "A malformed current-version lifecycle state was moved to a "
             "mode-600 content-addressed quarantine without treating it as "
             "empty. Its current session remains fail-closed behind a recovery "
-            "barrier; exactly one guarded recovery wait_agent is available, "
-            "and dispatch/final remain blocked."
+            "barrier, and dispatch/final remain blocked."
+        )
+    else:
+        detail = (
+            "A valid current v13 state crossed a startup, resume, or clear "
+            "boundary with tracked workers or pending dispatches. The old "
+            "records were preserved, but they are not proof that native "
+            "children still exist. Dispatch and final remain blocked until "
+            "native state is reconciled."
         )
     return (
         detail
-        + " Run one-shot list_agents. Only if it shows /root and no native "
-        "children, submit this exact session-bound operator command: "
+        + " Before calling wait_agent, run one-shot list_agents. If it shows "
+        "/root and no native children, do not wait; submit this exact "
+        "session-bound operator command: "
         + operator_recovery_command(session_id)
+        + ". Only if list_agents shows real native children may you consume "
+        "the single guarded recovery wait for this recovery epoch."
     )
 
 
@@ -2044,6 +2364,20 @@ def session_start(payload: dict[str, Any]) -> dict[str, Any]:
                 )
             elif has_recovery_barrier(state):
                 recovery_context = legacy_recovery_context(state, session_id)
+            elif (
+                source in NATIVE_RECONCILIATION_SOURCES
+                and has_active_work(state)
+            ):
+                arm_current_resume_barrier(state, source)
+                write_state(state_path, state)
+                recovery_context = legacy_recovery_context(state, session_id)
+                audit_record(
+                    audit_path,
+                    payload,
+                    "SessionStart",
+                    "current-active-recovery",
+                    epoch=state["event_epoch"],
+                )
             # A successfully validated lifecycle boundary closes any prior
             # failure episode. A corrupt state cannot reach this reset.
             remove_path(recovery_path)
@@ -2055,7 +2389,7 @@ def session_start(payload: dict[str, Any]) -> dict[str, Any]:
             "additionalContext": recovery_context or (
                 "The interactive collaboration event gate is active. Codex V2 "
                 "encrypts spawn messages, so use the visible task_name capability "
-                "cceg1_<n|u>_<r|w>_<lane>_<capacity>_<active>_<d|h|u>; plaintext "
+                "cceg2_<n|u>_<r|w>_<lane>_<capacity>_<active>_<batch>_<position>_<size>_<d|h|u>; plaintext "
                 "V1 may use the fixed coordination headers. After dispatching "
                 "bounded native workers, call wait_agent once. Its PreToolUse "
                 "hook atomically registers the "
@@ -2130,7 +2464,7 @@ def guard_wait_agent(payload: dict[str, Any]) -> dict[str, Any]:
                     epoch=state["event_epoch"],
                 )
                 return wait_denial(
-                    "The one legacy-state recovery wait_agent authorization "
+                    "The one recovery-barrier wait_agent authorization "
                     "for this recovery epoch was already consumed. Do not retry "
                     "or use Stop to create a loop. Reconcile an actual worker "
                     "completion, or use the exact session-bound operator command "
@@ -2148,7 +2482,7 @@ def guard_wait_agent(payload: dict[str, Any]) -> dict[str, Any]:
             )
             return wait_allow(
                 tool_input,
-                "One session-bound legacy-state recovery wait was consumed "
+                "One session-bound recovery-barrier wait was consumed "
                 "and rewritten to 3600000ms without constructing ledger "
                 "metadata. Do not repeat it unless a real tracked worker "
                 "completion creates a new recovery epoch.",
@@ -2166,6 +2500,21 @@ def guard_wait_agent(payload: dict[str, Any]) -> dict[str, Any]:
                 "pending native dispatches "
                 "remain. Do not retry; reconcile results and finish normally."
             )
+        if state["batch_intent"] is not None:
+            intent_error = batch_intent_error(state)
+            if intent_error:
+                audit_record(
+                    audit_path,
+                    payload,
+                    "PreToolUse",
+                    "wait-denied-batch-intent",
+                    epoch=state["event_epoch"],
+                )
+                return wait_denial(
+                    f"wait_agent is blocked because {intent_error}. Do not "
+                    "wait or poll; dispatch the missing declared lane(s) with "
+                    "the same batch ID, capacity, and final active count."
+                )
         ledger = state["ledger"]
         if ledger is None:
             try:
@@ -2241,6 +2590,9 @@ def guard_wait_agent(payload: dict[str, Any]) -> dict[str, Any]:
             )
         state["wait_issued_epoch"] = state["event_epoch"]
         state["wait_call_hash"] = call_key
+        # The complete visible declaration is now bound to this verified wait.
+        # A later follow-up must open a distinct intent after a lifecycle event.
+        state["batch_intent"] = None
         write_state(state_path, state)
         audit_record(
             audit_path,
@@ -2374,7 +2726,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> dict[str, Any]:
         if prompt.startswith(OPERATOR_RECOVERY_PREFIX):
             if prompt != expected_command:
                 recovery_context = (
-                    "The legacy-state repair command was rejected because it "
+                    "The recovery-barrier repair command was rejected because it "
                     "does not match this hook payload's authoritative session "
                     "identity and exact confirmation phrase. No state changed."
                 )
@@ -2388,8 +2740,8 @@ def user_prompt_submit(payload: dict[str, Any]) -> dict[str, Any]:
                 state = repaired
                 recovery_context = (
                     "The explicit session-bound operator confirmation reset "
-                    "the quarantined or migrated legacy barrier to valid empty "
-                    "current state. Normal bounded spawn_agent followed by the "
+                    "the validated recovery barrier to valid empty current "
+                    "state. Normal bounded spawn_agent followed by the "
                     "hook-owned ledger wait is available."
                 )
                 outcome = "operator-repaired-empty"
@@ -2402,7 +2754,7 @@ def user_prompt_submit(payload: dict[str, Any]) -> dict[str, Any]:
             else:
                 recovery_context = (
                     "The session-bound operator repair command was rejected "
-                    "because no validated legacy recovery barrier exists. No "
+                    "because no validated recovery barrier exists. No "
                     "current-version state was discarded."
                 )
                 outcome = "operator-repair-no-barrier"
@@ -2622,6 +2974,7 @@ def main() -> int:
             )
             return 2
         payload = loaded
+        pin_runtime_snapshot()
         emit(update_for_event(payload))
     except Exception:
         event = text_field(payload, "hook_event_name")

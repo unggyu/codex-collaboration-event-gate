@@ -4,13 +4,33 @@ All notable changes to this project are documented here.
 
 ## Unreleased
 
+- Reconcile native `interrupt_agent` responses whose completed prior status is
+  encoded as a single-key tagged object carrying the worker result.
+- Replace the visible V2 declaration with `cceg2_` and require a bounded,
+  session-bound batch ID, position, and size. `wait_agent` now fails closed
+  until every coordinator-declared position is dispatched; an incomplete
+  intent cannot be replaced, while complete one-worker batches and steering/
+  recovery re-arms remain valid. Document that omitted task semantics remain
+  unenforceable at the hook boundary.
+- Pin the exact loaded hook runtime under `PLUGIN_DATA` and execute it through
+  a digest-bound loader, allowing live sessions to reconcile worker completion
+  and final Stop after their installed cache snapshot is removed.
+- Instruct coordinators never to close their own Codex/Orca terminal in
+  response to a hook failure.
+- Convert active current v13 state crossing a startup, resume, or clear
+  boundary into a native-reconciliation barrier. Coordinators now inspect
+  `list_agents` before any recovery wait and repair root-only stale state
+  without waiting; compacted live turns remain on the normal lifecycle path.
+- Reject duplicate lanes, live-batch capacity changes, and over-capacity
+  follow-up dispatches before state mutation, preventing invalid native work
+  from starting or stranding later lifecycle hooks.
 - Support Codex Multi-Agent V2's encrypted `spawn_agent.message` boundary with
-  a strict visible `cceg1_` task-name capability for non-secret coordination
+  a strict visible `cceg2_` task-name capability for non-secret coordination
   metadata; retain plaintext fixed headers for V1.
 - Fail closed before state mutation for encrypted V2 dispatches with a missing
   or malformed capability, mixed metadata surfaces, or policies whose exact
   gate/evidence value is not visible to the local hook.
-- Persist a valid empty v12 state during a brand-new `SessionStart` instead of
+- Persist a valid empty v13 state during a brand-new `SessionStart` instead of
   leaving only its lock file.
 - Report missing or invalid root spawn declarations as correctable
   input-contract denials instead of generic lifecycle-state corruption.

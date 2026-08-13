@@ -97,7 +97,11 @@ def spawn_payload(
     task_name="opaque-test-worker",
     ledger_capacity=1,
     ledger_active=1,
+    batch_id="batchone",
+    batch_position=1,
+    batch_size=None,
 ):
+    batch_size = batch_size or ledger_capacity
     message = "\n".join(
         (
             "CLASSIFICATION: non-UI",
@@ -105,6 +109,9 @@ def spawn_payload(
             f"LEDGER_LANE: {call_id}",
             f"LEDGER_SLOT_CAPACITY: {ledger_capacity}",
             f"LEDGER_CURRENT_ACTIVE: {ledger_active}",
+            f"LEDGER_BATCH_ID: {batch_id}",
+            f"LEDGER_BATCH_POSITION: {batch_position}",
+            f"LEDGER_BATCH_SIZE: {batch_size}",
         )
     )
     value = {
@@ -290,7 +297,17 @@ for suffix in ("a", "b"):
     task_name = f"worker-{suffix}"
     spawn_call = f"spawn-{suffix}"
     run_hook(
-        spawn_payload(session, spawn_call, task_name=task_name), state_name
+        spawn_payload(
+            session,
+            spawn_call,
+            task_name=task_name,
+            ledger_capacity=2,
+            ledger_active=2,
+            batch_id="interruptbatch",
+            batch_position=1 if suffix == "a" else 2,
+            batch_size=2,
+        ),
+        state_name,
     )
     run_hook(
         spawn_post(
@@ -305,6 +322,9 @@ for suffix in ("a", "b"):
         lifecycle("SubagentStart", session, f"opaque-agent-{suffix}"),
         state_name,
     )
+assert_allowed(
+    run_hook(wait_payload(session, call_id="wait-before-interrupt"), state_name)
+)
 interrupt_call = "interrupt-agent-a"
 assert run_hook(
     interrupt_payload(session, interrupt_call, "/root/worker-a"), state_name
@@ -390,6 +410,69 @@ run_hook(
 assert run_hook(lifecycle("Stop", session, active=True), state_name) == {}
 print("PASS: interrupt reconciliation removes exactly one confirmed target and preserves every other worker.")
 
+# Native completed statuses carry their worker result as a tagged object,
+# unlike running statuses, which are returned as a string. A completed pending
+# dispatch must still be cleared by its exact interrupt capability.
+state_name = "interrupt-completed-pending"
+session = state_name
+spawn_call = "spawn-completed-pending"
+task_name = "completed-pending-worker"
+run_hook(
+    spawn_payload(session, spawn_call, task_name=task_name), state_name
+)
+run_hook(
+    spawn_post(
+        session,
+        spawn_call,
+        {"task_name": f"/root/{task_name}"},
+        task_name=task_name,
+    ),
+    state_name,
+)
+ambiguous_call = "interrupt-completed-pending-ambiguous"
+assert run_hook(
+    interrupt_payload(session, ambiguous_call, f"/root/{task_name}"),
+    state_name,
+) == {}
+assert run_hook(
+    interrupt_payload(
+        session,
+        ambiguous_call,
+        f"/root/{task_name}",
+        event="PostToolUse",
+        response={
+            "previous_status": {
+                "completed": "bounded worker result",
+                "running": None,
+            }
+        },
+    ),
+    state_name,
+) == {}
+snapshot = json.loads(state_files(state_name)[0].read_text(encoding="utf-8"))
+assert len(snapshot["pending"]) == 1
+
+interrupt_call = "interrupt-completed-pending"
+assert run_hook(
+    interrupt_payload(session, interrupt_call, f"/root/{task_name}"),
+    state_name,
+) == {}
+interrupted = run_hook(
+    interrupt_payload(
+        session,
+        interrupt_call,
+        f"/root/{task_name}",
+        event="PostToolUse",
+        response={"previous_status": {"completed": "bounded worker result"}},
+    ),
+    state_name,
+)
+assert "exact interrupted target" in interrupted["hookSpecificOutput"]["additionalContext"]
+snapshot = json.loads(state_files(state_name)[0].read_text(encoding="utf-8"))
+assert snapshot["workers"] == {} and snapshot["pending"] == {}
+assert run_hook(lifecycle("Stop", session), state_name) == {}
+print("PASS: tagged completed interrupt responses clear the exact pending dispatch.")
+
 # PreToolUse(spawn_agent) is the durable authority. It must allow the first
 # wait and deny Stop while a later or dropped SubagentStart has not arrived.
 state_name = "pending-start-gap"
@@ -425,9 +508,17 @@ print("PASS: a pending spawn closes the Start delivery gap across parent/child t
 # FIFO order and each corresponding Stop leaves no stale pending authority.
 state_name = "fifo-parent-child-turns"
 session = state_name
-for call in ("call-first", "call-second", "call-third"):
+for position, call in enumerate(("call-first", "call-second", "call-third"), start=1):
     run_hook(
-        spawn_payload(session, call, ledger_capacity=3, ledger_active=3),
+        spawn_payload(
+            session,
+            call,
+            ledger_capacity=3,
+            ledger_active=3,
+            batch_id="fifobatch",
+            batch_position=position,
+            batch_size=3,
+        ),
         state_name,
     )
     run_hook(spawn_post(session, call, {"accepted": True}), state_name)

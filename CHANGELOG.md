@@ -4,6 +4,25 @@ All notable changes to this project are documented here.
 
 ## Unreleased
 
+- Recover strict v7 state on a new `SessionStart` by preserving lifecycle
+  identities as explicitly unobserved ledger metadata and authorizing one
+  bounded ledger-bypass wait.
+- Quarantine unsafe legacy and malformed current-version bytes atomically
+  behind distinct fail-closed recovery barriers.
+- Add an idempotent operator-confirmed empty-native repair bound only to the
+  hook payload `session_id`, never `CODEX_THREAD_ID` or a caller-selected path.
+- Require owned mode-`0600` runtime objects and cover upgrade identity,
+  consumed recovery, lock contention, interrupted writes, and quarantine
+  collisions deterministically.
+- Replace the uncallable external ledger script with a hook-owned protocol:
+  root `spawn_agent` metadata binds a fresh session ledger during the first
+  normal `wait_agent`, without exposing `PLUGIN_DATA` or accepting a caller
+  session ID.
+- Require a one-to-one mapping between every tracked active/pending native
+  dispatch and active ledger lane; reject missing, duplicate, phantom, and
+  count-only coverage while deriving active count from observed dispatches.
+- Enforce exact exclusive-gate conflicts, lane capacity, observed spawn model
+  policy, and epoch invalidation after steering/completion.
 - Reconcile successful `interrupt_agent` calls against one exact tracked
   target, without relying on `SubagentStop` or affecting sibling workers.
 - Re-arm one wait after a correlated non-timeout `wait_agent` return so
@@ -12,6 +31,10 @@ All notable changes to this project are documented here.
   intermediate-message re-arm, and timeout no-polling behavior.
 - Document the required plain-shell reinstall boundary so an active Codex
   session cannot lose the cache path of its loaded hook snapshot.
+
+## 0.2.0
+
+- Introduce session-bound parallelism-ledger enforcement.
 
 ## 0.1.0
 

@@ -11,6 +11,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = ROOT / ".codex-plugin" / "plugin.json"
+PLUGIN_NAME = "codex-collaboration-event-gate"
 SEMVER = re.compile(
     r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
     r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
@@ -26,7 +27,7 @@ def require(condition: bool, message: str) -> None:
 try:
     value = json.loads(MANIFEST.read_text(encoding="utf-8"))
     require(isinstance(value, dict), "manifest must be a JSON object")
-    require(value.get("name") == ROOT.name, "manifest name must match root")
+    require(value.get("name") == PLUGIN_NAME, "manifest name is invalid")
     require(isinstance(value.get("version"), str) and SEMVER.fullmatch(value["version"]), "version must be strict semver")
     require(isinstance(value.get("description"), str) and value["description"].strip(), "description is required")
     author = value.get("author")

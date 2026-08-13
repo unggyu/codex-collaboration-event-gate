@@ -16,12 +16,13 @@ import re
 
 
 ROOT = Path(__file__).resolve().parent.parent
+PLUGIN_NAME = "codex-collaboration-event-gate"
 HOOK = ROOT / "hooks" / "codex-collaboration-lifecycle.py"
 CONFIG = ROOT / "hooks" / "hooks.json"
 MANIFEST = ROOT / ".codex-plugin" / "plugin.json"
 VENDOR = ROOT / "scripts" / "vendor-project-local.py"
 README = ROOT / "README.md"
-SKILL = ROOT / "skills" / ROOT.name / "SKILL.md"
+SKILL = ROOT / "skills" / PLUGIN_NAME / "SKILL.md"
 
 
 def run(
@@ -46,8 +47,8 @@ def run(
 
 
 manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
-assert manifest["name"] == ROOT.name
-assert re.fullmatch(r"0\.1\.0(?:\+codex\.[A-Za-z0-9.-]+)?", manifest["version"])
+assert manifest["name"] == PLUGIN_NAME
+assert re.fullmatch(r"0\.2\.0(?:\+codex\.[A-Za-z0-9.-]+)?", manifest["version"])
 assert manifest["license"] == "MIT"
 assert manifest["author"]["name"] != "Local developer"
 assert "hooks" not in manifest
@@ -80,6 +81,26 @@ for node in ast.walk(tree):
         name = f"{getattr(node.func.value, 'id', '')}.{node.func.attr}"
     assert name not in {"sleep", "time.sleep", "wait_agent", "list_agents"}
 print("PASS: manifest and default-discovery hook contract are portable.")
+
+assert not (ROOT / "scripts" / "register-coordination-ledger.py").exists()
+assert "LEDGER_LANE" in source and "LEDGER_SLOT_CAPACITY" in source
+assert "LEDGER_CURRENT_ACTIVE" in source
+assert "hook_owned_ledger" in source and "validate_ledger_coverage" in source
+assert "register-coordination-ledger" not in source
+print("PASS: new sessions use the hook-owned callable registration protocol.")
+
+for contract in (
+    "LEGACY_STATE_VERSIONS",
+    "migrate_v7_state",
+    "quarantine_state_bytes",
+    "OPERATOR_RECOVERY_PREFIX",
+):
+    assert contract in source
+assert "CODEX_THREAD_ID" not in source
+normalized_readme = " ".join(README.read_text(encoding="utf-8").split())
+assert "payload's `session_id`" in normalized_readme
+assert "malformed v12 state" in normalized_readme.lower()
+print("PASS: upgrade recovery is bound to hook payload identity and distinguishes legacy from current corruption.")
 
 readme = README.read_text(encoding="utf-8")
 skill = SKILL.read_text(encoding="utf-8")
@@ -127,7 +148,7 @@ with tempfile.TemporaryDirectory(prefix="codex-event-gate-vendor.") as name:
         env=env,
     )
     hooks_json = project / ".codex" / "hooks.json"
-    vendored = project / ".codex" / "hooks" / ROOT.name
+    vendored = project / ".codex" / "hooks" / PLUGIN_NAME
     assert hooks_json.is_file()
     assert (vendored / HOOK.name).is_file()
     assert (vendored / "run-hook.sh").is_file()
@@ -232,7 +253,7 @@ with tempfile.TemporaryDirectory(prefix="codex-event-gate-vendor.") as name:
     fake_codex.write_text(
         "#!/bin/sh\nprintf '%s\\n' "
         "'{\"installed\":[{\"name\":"
-        f"\"{ROOT.name}\""
+        f"\"{PLUGIN_NAME}\""
         "}],\"available\":[]}'\n",
         encoding="utf-8",
     )

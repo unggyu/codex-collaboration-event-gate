@@ -95,12 +95,28 @@ def spawn_payload(
     child=False,
     tool_name="Agent",
     task_name="opaque-test-worker",
+    ledger_capacity=1,
+    ledger_active=1,
 ):
+    message = "\n".join(
+        (
+            "CLASSIFICATION: non-UI",
+            "PARALLELISM_CLASS: read-only",
+            f"LEDGER_LANE: {call_id}",
+            f"LEDGER_SLOT_CAPACITY: {ledger_capacity}",
+            f"LEDGER_CURRENT_ACTIVE: {ledger_active}",
+        )
+    )
     value = {
         "cwd": "/safe/non-git/project",
         "hook_event_name": "PreToolUse",
         "session_id": session,
-        "tool_input": {"task_name": task_name},
+        "tool_input": {
+            "task_name": task_name,
+            "message": message,
+            "model": "gpt-5.6-terra",
+            "fork_turns": "none",
+        },
         "tool_name": tool_name,
         "tool_use_id": call_id,
         "turn_id": f"turn-{session}",
@@ -410,7 +426,10 @@ print("PASS: a pending spawn closes the Start delivery gap across parent/child t
 state_name = "fifo-parent-child-turns"
 session = state_name
 for call in ("call-first", "call-second", "call-third"):
-    run_hook(spawn_payload(session, call), state_name)
+    run_hook(
+        spawn_payload(session, call, ledger_capacity=3, ledger_active=3),
+        state_name,
+    )
     run_hook(spawn_post(session, call, {"accepted": True}), state_name)
 state_file = state_files(state_name)[0]
 initial = json.loads(state_file.read_text(encoding="utf-8"))

@@ -9,6 +9,23 @@ Use bounded native Codex workers from the root coordinator. Tell every worker
 not to spawn workers, give it explicit scope and completion criteria, and let
 independent tasks run concurrently.
 
+Every root `spawn_agent` message must declare `LEDGER_LANE`, shared
+`LEDGER_SLOT_CAPACITY`, and shared `LEDGER_CURRENT_ACTIVE`, as well as
+classification, parallelism class, exact exclusive gate(s), explicit model,
+and fork mode. Then call normal root `wait_agent`: its hook binds those
+same-session spawn capabilities into a fresh ledger and checks declared active
+count against observed dispatches. Do not use a script, session ID, or
+`PLUGIN_DATA` registrar. Missing, duplicate, phantom, or count-only active
+coverage fails closed. `git-ref:origin/qa` conflicts only with the same exact
+gate, not `git-ref:origin/develop`. After a verified wait, lifecycle events
+refresh surviving bound counts inside the hook; never try to refresh them.
+
+For spawn metadata, declare `CLASSIFICATION` and `PARALLELISM_CLASS` in the
+worker message, and `EXCLUSIVE_GATE` for an exclusive lane. Non-UI workers use
+explicit `gpt-5.6-terra`; never use `fork_turns=all`. Use Sol only for explicit
+novel high-complexity UI or `SOL_OVERRIDE_REASON: user-requested` or
+`terra-blocked:<specific evidence>`.
+
 After dispatch, call `wait_agent` exactly once. `PreToolUse` rewrites it to
 `3600000ms`; the native subscription consumes no model polling turns and
 remains interruptible by steered user input. When one worker completes or the
@@ -27,6 +44,17 @@ wait; a repeated final attempt fails closed without another continuation.
 Use `list_agents` only for one-shot diagnosis or recovery reconciliation.
 After a hook failure, use one recovery wait only when the hook explicitly says
 it was authorized.
+
+On upgrade/resume, treat the hook payload `session_id` as authoritative; never
+derive state from `CODEX_THREAD_ID`. `SessionStart` may preserve strict legacy
+workers behind a ledger-bypass recovery barrier or quarantine unsafe legacy
+bytes. Consume only the reported recovery wait. If one-shot `list_agents`
+shows `/root` alone, the operator may submit the exact
+`/collaboration-recover-empty <current-session-sha256>
+confirm-native-root-only` command printed by `SessionStart`. Never construct a
+hash or command yourself. A malformed current-version state remains
+fail-closed behind a distinct quarantine barrier and requires the same
+explicit native-empty operator confirmation.
 
 Treat worker completion as an event, not proof that the requested outcome is
 complete. Never promise a passive wake after the parent turn has ended.

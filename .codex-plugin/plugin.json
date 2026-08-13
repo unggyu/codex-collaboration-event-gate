@@ -1,6 +1,6 @@
 {
   "name": "codex-collaboration-event-gate",
-  "version": "0.2.0+codex.20260813030610",
+  "version": "0.2.0+codex.20260813034421",
   "description": "Coordinate native Codex subagents with a session-bound parallelism ledger and one event subscription.",
   "author": {
     "name": "codex-collaboration-event-gate contributors"

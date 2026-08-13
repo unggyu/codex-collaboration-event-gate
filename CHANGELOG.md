@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## Unreleased
 
+- Persist a valid empty v12 state during a brand-new `SessionStart` instead of
+  leaving only its lock file.
+- Report missing or invalid root spawn declarations as correctable
+  input-contract denials instead of generic lifecycle-state corruption.
 - Recover strict v7 state on a new `SessionStart` by preserving lifecycle
   identities as explicitly unobserved ledger metadata and authorizing one
   bounded ledger-bypass wait.

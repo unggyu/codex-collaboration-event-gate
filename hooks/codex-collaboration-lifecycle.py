@@ -1124,7 +1124,14 @@ def record_spawn_dispatch(payload: dict[str, Any]) -> dict[str, Any]:
     session_id = text_field(payload, "session_id")
     if not session_id:
         raise StateCorruption("missing spawn_agent session identity")
-    metadata = spawn_metadata(payload.get("tool_input"))
+    try:
+        metadata = spawn_metadata(payload.get("tool_input"))
+    except StateCorruption as error:
+        return wait_denial(
+            f"spawn_agent metadata is invalid: {error}. Correct the fixed "
+            "coordination headers and retry this dispatch once. This is an "
+            "input-contract rejection, not lifecycle-state corruption."
+        )
     error = policy_error(metadata)
     if error:
         return wait_denial(
@@ -1966,7 +1973,17 @@ def session_start(payload: dict[str, Any]) -> dict[str, Any]:
             )
         else:
             load_recovery_control(recovery_path, session_id)
-            if existed and has_recovery_barrier(state):
+            if not existed:
+                write_state(state_path, state)
+                existed = True
+                audit_record(
+                    audit_path,
+                    payload,
+                    "SessionStart",
+                    "missing-state-initialized",
+                    epoch=state["event_epoch"],
+                )
+            elif has_recovery_barrier(state):
                 recovery_context = legacy_recovery_context(state, session_id)
             # A successfully validated lifecycle boundary closes any prior
             # failure episode. A corrupt state cannot reach this reset.

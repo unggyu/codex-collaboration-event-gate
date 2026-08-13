@@ -29,6 +29,9 @@ infinite recovery loop.
   exact mode `0600`.
 - State and recovery JSON writes use same-directory temporary files, `fsync`,
   and atomic replacement.
+- A missing authoritative session state is initialized only by `SessionStart`
+  while holding that session's lock, as an owned mode-`0600` empty current
+  schema; it is never inferred from another session or environment identity.
 - State, recovery, audit, and lock objects must be regular non-symlink files.
 - JSON schemas and worker records are validated before use.
 - `fcntl.flock` serializes concurrent hook processes and makes each wait
@@ -77,6 +80,9 @@ observed dispatches, and fails closed when a lane is missing, duplicate,
 phantom, over capacity, or inconsistent with observed metadata. Unpaired
 native lifecycle events have no parent spawn payload; that is an explicit
 verification boundary, not a guessed policy assertion.
+Malformed fixed spawn declarations are denied before state mutation with a
+bounded, constant-family validation reason. Correcting and retrying that one
+dispatch cannot mint a recovery wait or bypass lifecycle validation.
 
 ## Hook trust
 

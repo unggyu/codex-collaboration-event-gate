@@ -26,6 +26,12 @@ explicit `gpt-5.6-terra`; never use `fork_turns=all`. Use Sol only for explicit
 novel high-complexity UI or `SOL_OVERRIDE_REASON: user-requested` or
 `terra-blocked:<specific evidence>`.
 
+Put the fixed declarations as literal lines at the start of every worker
+message; describing them only in coordinator prose does not register them. If
+the spawn hook names a missing or invalid declaration, correct that exact
+input and retry the same dispatch once. This bounded correction is not a wait
+retry and does not authorize recovery.
+
 After dispatch, call `wait_agent` exactly once. `PreToolUse` rewrites it to
 `3600000ms`; the native subscription consumes no model polling turns and
 remains interruptible by steered user input. When one worker completes or the

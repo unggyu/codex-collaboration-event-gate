@@ -106,6 +106,10 @@ When spawn metadata is present, the hook parses only fixed headers:
 `fork_turns`. Non-UI requires explicit `gpt-5.6-terra`; `fork_turns=all` is
 rejected; Sol requires novel high-complexity UI or
 `SOL_OVERRIDE_REASON: user-requested|terra-blocked:<specific evidence>`.
+Missing or invalid fixed headers are reported as a bounded input-contract
+denial naming the first invalid field. The root may correct that declaration
+and retry the same dispatch once; it is not reported as lifecycle-state
+corruption and does not authorize a recovery wait.
 Unpaired lifecycle events have no spawn metadata, so the hook records that
 boundary instead of inventing a cross-check.
 
@@ -133,7 +137,9 @@ valid v12 recovery barrier replaces it. A malformed v12 state is different: it
 is never migrated as legacy or treated as empty. Its bytes are quarantined
 behind a distinct current-corruption barrier and it remains fail-closed until
 the same explicit native-empty operator confirmation. Missing state remains
-the normal empty-session case.
+the normal empty-session case: `SessionStart` creates and atomically persists
+an owned mode-`0600` empty v12 state under the authoritative session lock
+before reporting the gate ready.
 
 The recovery barrier reports the SHA-256 identity of the current hook payload
 and an exact command of this form:

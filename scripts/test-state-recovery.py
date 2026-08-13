@@ -194,6 +194,51 @@ def repair_command(session: str) -> str:
 with tempfile.TemporaryDirectory(prefix="codex-event-gate-recovery.") as temporary:
     root = Path(temporary)
 
+    # A brand-new authoritative lifecycle must persist a current empty state
+    # during SessionStart. Missing spawn metadata is a correctable input error,
+    # not a generic state-verification failure, and a corrected dispatch works.
+    name = "fresh-session"
+    session = "fresh-authoritative-session"
+    fresh_started = start(root, name, session, "startup")
+    assert "event gate is active" in fresh_started["hookSpecificOutput"]["additionalContext"]  # type: ignore[index]
+    fresh_path = state_path(root, name, session)
+    assert fresh_path.exists()
+    assert stat.S_IMODE(fresh_path.stat().st_mode) == 0o600
+    fresh = json.loads(fresh_path.read_text())
+    assert fresh["version"] == 12
+    assert fresh["session_hash"] == digest(session)
+    assert fresh["workers"] == {} and fresh["pending"] == {}
+    assert fresh["ledger"] is None and fresh["ledger_verified"] is False
+    assert fresh["legacy_recovery"] is None
+
+    invalid_spawn = invoke(
+        root,
+        name,
+        event(
+            "PreToolUse",
+            session,
+            tool_input={
+                "task_name": "missing-ledger-headers",
+                "message": "Perform one bounded read-only smoke check.",
+                "model": "gpt-5.6-terra",
+                "fork_turns": "none",
+                "reasoning_effort": "medium",
+            },
+            tool_name="collaborationspawn_agent",
+            tool_use_id="missing-ledger-headers",
+        ),
+    )
+    invalid_reason = invalid_spawn["hookSpecificOutput"]["permissionDecisionReason"]  # type: ignore[index]
+    assert permission(invalid_spawn) == "deny"
+    assert "CLASSIFICATION must be UI or non-UI" in invalid_reason
+    assert "input-contract rejection, not lifecycle-state corruption" in invalid_reason
+    assert json.loads(fresh_path.read_text())["pending"] == {}
+    assert spawn(root, name, session, "corrected-ledger-dispatch") == {}
+    corrected = json.loads(fresh_path.read_text())
+    assert len(corrected["pending"]) == 1
+    assert corrected["last_event"] == "dispatch-pending"
+    print("PASS: fresh SessionStart persists empty v12 state and invalid spawn metadata is explicitly correctable.")
+
     # Exact incident: v7 active workers plus an already-consumed v2 recovery
     # token resume under the authoritative payload session_id.
     name = "migrate-v7"
@@ -423,6 +468,8 @@ with tempfile.TemporaryDirectory(prefix="codex-event-gate-recovery.") as tempora
         session = f"{suffix}-session"
         start(root, name + suffix, session, "startup")
         path = state_path(root, name + suffix, session)
+        assert path.is_file() and not path.is_symlink()
+        path.unlink()
         external = root / f"{suffix}-external"
         write_private(external, {"sentinel": suffix})
         install(path, external)

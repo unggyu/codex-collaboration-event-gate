@@ -10,7 +10,7 @@ the `Stop` hook is an enforcement check, not the waiter.
 
 | Component | Responsibility |
 | --- | --- |
-| `SessionStart` | Validate current state, migrate strict legacy state or create a quarantine barrier, and inject the coordination/recovery contract |
+| `SessionStart` | Atomically initialize missing current state, validate existing state, migrate strict legacy state or create a quarantine barrier, and inject the coordination/recovery contract |
 | `PreToolUse(spawn_agent)` | Record a pending dispatch before native worker creation can race the lifecycle hook |
 | `PreToolUse(wait_agent)` | Atomically build and validate one bounded, hash-only coordination ledger from the current root spawn capabilities |
 | `PostToolUse(spawn_agent)` | Clear explicitly failed dispatches and retain successful pending work until reconciliation |
@@ -63,6 +63,7 @@ wall-clock timestamp ordering, makes concurrent dispatch ordering deterministic.
 | Zero-worker Stop | Remove session/recovery state | Final may pass |
 | Strict v7 SessionStart | Preserve legacy work as unobserved metadata; clear stale wait/Stop capabilities; increment epoch | One ledger-bypass recovery wait, no conflicting dispatch/final |
 | Unsafe legacy SessionStart | Content-addressed quarantine plus valid current recovery barrier | One recovery wait or exact operator confirmation after native-empty diagnosis |
+| Missing-state SessionStart | Persist an owned mode-`0600` empty current state under the authoritative lock | Normal bounded dispatch |
 | Malformed current state | Preserve bytes in current-corruption quarantine; create a distinct valid barrier | Fail closed; one guarded wait or exact operator confirmation after native-empty diagnosis |
 | Session-bound operator confirmation | Verify exact current payload session hash and legacy barrier under lock; reset to empty current state | Normal bounded spawn and hook-owned ledger |
 
@@ -165,6 +166,12 @@ coordination headers in the spawn message. It enforces explicit Terra for
 non-UI, rejects `fork_turns=all`, and narrowly permits Sol. Current unpaired
 native lifecycle events do not expose a parent spawn payload; the hook does not
 invent missing metadata and records that verification boundary instead.
+
+Fixed spawn declarations are validated before lifecycle state is read or
+mutated. A missing or invalid declaration produces a specific input-contract
+denial naming the first invalid field. The root may correct and retry that
+dispatch once; the denial neither creates pending work nor enters generic
+state recovery.
 
 ## Completion semantics
 
